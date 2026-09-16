@@ -1,0 +1,98 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  owner
+  editor
+  viewer
+}
+
+model User {
+  id           String           @id @default(uuid())
+  email        String           @unique
+  name         String
+  passwordHash String
+  color        String
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  memberships  ProjectMember[]
+  ownedProjects Project[]       @relation("ProjectOwner")
+}
+
+model Project {
+  id        String          @id @default(uuid())
+  name      String
+  ownerId   String
+  owner     User            @relation("ProjectOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+  files     File[]
+  members   ProjectMember[]
+}
+
+model ProjectMember {
+  id        String   @id @default(uuid())
+  projectId String
+  userId    String
+  role      Role     @default(viewer)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+  @@index([userId])
+}
+
+model File {
+  id         String          @id @default(uuid())
+  projectId  String
+  name       String
+  path       String
+  language   String
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+  project    Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  snapshots  FileSnapshot[]
+  updates    DocumentUpdate[]
+
+  @@unique([projectId, path])
+  @@index([projectId])
+}
+
+/// Compacted Yjs document snapshot. The active snapshot plus all DocumentUpdate
+/// rows with id > lastUpdateId are enough to reconstruct the current document.
+model FileSnapshot {
+  id           String   @id @default(uuid())
+  fileId       String
+  /// yjs state vector of the compacted document
+  version      Int      @default(0)
+  /// Object storage key holding the encoded Y.Doc (Y.encodeStateAsUpdate)
+  s3Key        String
+  /// Highest DocumentUpdate.id included in this snapshot
+  lastUpdateId Int      @default(0)
+  sizeBytes    Int      @default(0)
+  createdAt    DateTime @default(now())
+  file         File     @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@unique([fileId, version])
+  @@index([fileId])
+}
+
+/// Individual Yjs updates (append-only log) between two snapshots.
+model DocumentUpdate {
+  id        BigInt  @id @default(autoincrement())
+  fileId    String
+  update    Bytes
+  sizeBytes Int
+  createdAt DateTime @default(now())
+  file      File     @relation(fields: [fileId], references: [id], onDelete: Cascade)
+
+  @@index([fileId, id])
+}

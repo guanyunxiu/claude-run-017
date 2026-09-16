@@ -1,0 +1,16 @@
+{
+  "name": "collab-editor-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Two-browser collaboration E2E tests (Playwright)",
+  "scripts": {
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.47.2",
+    "@types/node": "^20.16.10",
+    "typescript": "^5.6.2"
+  }
+}
