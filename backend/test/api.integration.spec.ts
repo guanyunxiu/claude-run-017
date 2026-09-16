@@ -180,8 +180,10 @@ class InMemoryPrisma {
 
   fileSnapshot = {
     findFirst: async () => null,
+    findMany: async () => [] as any[],
     create: async () => ({}),
     count: async () => 0,
+    deleteMany: async () => ({ count: 0 }),
   };
 }
 
@@ -344,6 +346,39 @@ describe('REST API (HTTP integration)', () => {
       .set('Authorization', `Bearer ${editorToken}`)
       .send({ name: 'renamed.ts' })
       .expect(200);
+
+    // ---- Version history endpoint permissions ----
+    // Members can list (empty list on the in-memory fake).
+    await request(app.getHttpServer())
+      .get(`/api/files/${fileId}/versions`)
+      .set('Authorization', `Bearer ${viewerToken}`)
+      .expect(200)
+      .expect((res) => expect(Array.isArray(res.body.versions)).toBe(true));
+
+    // Stranger cannot list versions.
+    await request(app.getHttpServer())
+      .get(`/api/files/${fileId}/versions`)
+      .set('Authorization', `Bearer ${stranger.token}`)
+      .expect(404);
+
+    // Viewer cannot restore (owner-only), even though the version does not
+    // exist: the role gate runs before snapshot lookup and returns 403.
+    await request(app.getHttpServer())
+      .post(`/api/files/${fileId}/versions/0/restore`)
+      .set('Authorization', `Bearer ${viewerToken}`)
+      .expect(403);
+
+    // Editor cannot restore either.
+    await request(app.getHttpServer())
+      .post(`/api/files/${fileId}/versions/0/restore`)
+      .set('Authorization', `Bearer ${editorToken}`)
+      .expect(403);
+
+    // Owner passes the role gate but gets 404 for the missing version.
+    await request(app.getHttpServer())
+      .post(`/api/files/${fileId}/versions/99/restore`)
+      .set('Authorization', `Bearer ${ownerToken}`)
+      .expect(404);
   });
 
   it('rejects invalid input with 400', async () => {

@@ -56,6 +56,21 @@ class FakePrisma {
   fileSnapshot = {
     findFirst: async ({ where }: { where: { fileId: string } }) =>
       this.snapshots.filter((s) => s.fileId === where.fileId).at(-1) ?? null,
+    findMany: async (args: {
+      where?: { fileId?: string; version?: { lt?: number } };
+      orderBy?: { version?: 'asc' | 'desc' };
+      take?: number;
+    } = {}) => {
+      let rows = [...this.snapshots];
+      if (args.where?.fileId) rows = rows.filter((s) => s.fileId === args.where!.fileId);
+      if (args.where?.version?.lt !== undefined)
+        rows = rows.filter((s) => s.version < args.where!.version!.lt!);
+      rows.sort((a, b) =>
+        args.orderBy?.version === 'asc' ? a.version - b.version : b.version - a.version,
+      );
+      if (args.take) rows = rows.slice(0, args.take);
+      return rows;
+    },
     create: async ({ data }: { data: Record<string, unknown> }) => {
       const row = { id: `s${this.snapshots.length}`, ...data } as never;
       this.snapshots.push(row as never);
@@ -63,7 +78,11 @@ class FakePrisma {
     },
     count: async ({ where }: { where: { fileId: string } }) =>
       this.snapshots.filter((s) => s.fileId === where.fileId).length,
-    deleteMany: async () => ({ count: 0 }),
+    deleteMany: async ({ where }: { where: { id?: string } }) => {
+      const before = this.snapshots.length;
+      this.snapshots = this.snapshots.filter((s) => s.id !== where.id);
+      return { count: before - this.snapshots.length };
+    },
   };
 }
 

@@ -20,6 +20,8 @@ x-backend-environment: &backend-environment
   PERSIST_FLUSH_MS: "5000"
   SNAPSHOT_INTERVAL_MS: "60000"
   ROOM_TTL_MS: "60000"
+  FILE_HISTORY_LIMIT: "20"
+  RESTORE_LOCK_MS: "30000"
   PRESENCE_TTL_SECONDS: "30"
 
 x-backend-healthcheck: &backend-healthcheck

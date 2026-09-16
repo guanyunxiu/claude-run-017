@@ -3,6 +3,7 @@ import { useParams } from 'react-router-dom';
 import TopBar, { Avatar } from '../components/TopBar';
 import FileTree from '../components/FileTree';
 import MembersPanel from '../components/MembersPanel';
+import { VersionHistoryPanel } from '../components/VersionHistoryPanel';
 import MonacoEditor from '../components/MonacoEditor';
 import { api, ApiError } from '../api/client';
 import { useAuth } from '../auth/AuthContext';
@@ -36,6 +37,7 @@ export default function ProjectPage() {
   const [files, setFiles] = useState<FileNode[] | null>(null);
   const [members, setMembers] = useState<MemberRow[]>([]);
   const [activeFileId, setActiveFileId] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const [loadingError, setLoadingError] = useState<string | null>(null);
 
   const loadProject = useCallback(async () => {
@@ -249,6 +251,14 @@ export default function ProjectPage() {
                     >
                       ↻
                     </button>
+                    <button
+                      className="secondary"
+                      data-testid="version-history-button"
+                      onClick={() => setHistoryOpen((v) => !v)}
+                      title="Version history"
+                    >
+                      History
+                    </button>
                     <span
                       className="presence-list"
                       data-testid="presence-list"
@@ -300,6 +310,18 @@ export default function ProjectPage() {
                   </div>
                 )}
               </div>
+              {historyOpen && (
+                <VersionHistoryPanel
+                  fileId={activeFile.id}
+                  role={myRole}
+                  onClose={() => setHistoryOpen(false)}
+                  onRestored={() => {
+                    // Live editors converge automatically via the restore
+                    // bus commit; show a confirmation toast.
+                    toast.success('Document restored');
+                  }}
+                />
+              )}
             </>
           )}
         </main>

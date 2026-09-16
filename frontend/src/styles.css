@@ -476,3 +476,108 @@ a:hover {
     transform: rotate(360deg);
   }
 }
+
+/* ---------------- Version history panel ---------------- */
+.version-panel {
+  position: absolute;
+  top: 44px;
+  right: 12px;
+  bottom: 12px;
+  width: 560px;
+  max-width: calc(100% - 24px);
+  background: var(--bg-panel, #252526);
+  border: 1px solid var(--border, #3c3c3c);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  z-index: 40;
+  overflow: hidden;
+}
+.version-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border, #3c3c3c);
+}
+.version-panel__body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.version-list {
+  width: 180px;
+  border-right: 1px solid var(--border, #3c3c3c);
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+}
+.version-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text, #d4d4d4);
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.version-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.version-item--active {
+  background: rgba(78, 201, 176, 0.15);
+  border-color: var(--accent, #4ec9b0);
+}
+.version-item__number {
+  font-weight: 600;
+}
+.version-item__meta {
+  font-size: 11px;
+  color: var(--text-dim, #9d9d9d);
+}
+.version-preview {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+  gap: 8px;
+  min-width: 0;
+}
+.version-preview__head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+}
+.version-preview__content {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: 8px;
+  background: #1e1e1e;
+  border: 1px solid var(--border, #3c3c3c);
+  border-radius: 4px;
+  font-family: var(--mono-font, monospace);
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+.version-panel__hint {
+  padding: 12px;
+  color: var(--text-dim, #9d9d9d);
+  font-size: 13px;
+}
+.restore-confirm {
+  border: 1px solid var(--danger, #f44336);
+  border-radius: 6px;
+  padding: 12px;
+}
+.restore-confirm__actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}

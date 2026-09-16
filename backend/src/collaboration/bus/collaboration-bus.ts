@@ -22,13 +22,18 @@ export type BusMessageKind =
   | 'awareness'
   | 'sync-step1'
   | 'sync-step2'
-  | 'persisted';
+  | 'persisted'
+  | 'restore-prepare'
+  | 'restore-commit'
+  | 'restore-abort';
 
 export interface BusMessageHeader {
   /** sending instance id */
   i: string;
   /** for targeted replies (sync-step2): destination instance id */
   t?: string;
+  /** opaque correlation id (restore sessions) */
+  rid?: string;
 }
 
 export interface BusHandlers {
@@ -53,6 +58,25 @@ export interface BusHandlers {
    * updates are durable and to prune their safety buffers.
    */
   onPersisted(fileId: string, stateVector: Uint8Array, fromInstance: string): void;
+  /**
+   * A coordinator is about to reset the document to a historical version.
+   * Warm rooms enter a restore barrier: stop broadcasting/persisting
+   * in-flight edits and wait for commit (or abort). Payload carries the
+   * correlation id (`rid` in header).
+   */
+  onRestorePrepare(fileId: string, fromInstance: string, rid: string): void;
+  /**
+   * The reset Yjs update making the target snapshot the new authority.
+   * Applied with a special restore origin and broadcast to live clients.
+   */
+  onRestoreCommit(
+    fileId: string,
+    update: Uint8Array,
+    fromInstance: string,
+    rid: string,
+  ): void;
+  /** The restore attempt was abandoned; rooms leave the barrier and resume. */
+  onRestoreAbort(fileId: string, fromInstance: string, rid: string): void;
 }
 
 /**
@@ -108,6 +132,15 @@ export abstract class CollaborationBus {
       case 'persisted':
         this.handlers.onPersisted(fileId, payload, header.i);
         break;
+      case 'restore-prepare':
+        this.handlers.onRestorePrepare(fileId, header.i, header.rid ?? '');
+        break;
+      case 'restore-commit':
+        this.handlers.onRestoreCommit(fileId, payload, header.i, header.rid ?? '');
+        break;
+      case 'restore-abort':
+        this.handlers.onRestoreAbort(fileId, header.i, header.rid ?? '');
+        break;
     }
   }
 
@@ -130,6 +163,22 @@ export abstract class CollaborationBus {
   ): Promise<void>;
   /** Broadcast that the leader durably flushed up to this state vector. */
   abstract publishPersisted(fileId: string, stateVector: Uint8Array): Promise<void>;
+
+  // Restore protocol (all broadcast on the document channel).
+  abstract publishRestorePrepare(fileId: string, rid: string): Promise<void>;
+  abstract publishRestoreCommit(
+    fileId: string,
+    rid: string,
+    resetUpdate: Uint8Array,
+  ): Promise<void>;
+  abstract publishRestoreAbort(fileId: string, rid: string): Promise<void>;
+
+  /**
+   * Acquire a short-lived, exclusive restore lock for a document. Only the
+   * holder coordinates a reset; prevents two owners restoring concurrently.
+   */
+  abstract acquireRestoreLock(fileId: string, ttlMs: number): Promise<boolean>;
+  abstract releaseRestoreLock(fileId: string): Promise<void>;
 
   /**
    * Tell every instance (including this one's peer services) to close all
@@ -164,6 +213,10 @@ export function lockKey(fileId: string): string {
   return `collab:lock:doc:${fileId}`;
 }
 
+export function restoreLockKey(fileId: string): string {
+  return `collab:restore:doc:${fileId}`;
+}
+
 // ---------------------------------------------------------------------------
 // Wire framing for redis pub/sub payloads:
 //   [kind:1][headerLen:4 BE][header JSON UTF-8][payload bytes]
@@ -175,6 +228,9 @@ const KIND_CODES: Record<BusMessageKind, number> = {
   'sync-step1': 3,
   'sync-step2': 4,
   persisted: 5,
+  'restore-prepare': 6,
+  'restore-commit': 7,
+  'restore-abort': 8,
 };
 const CODE_KINDS: Record<number, BusMessageKind> = Object.fromEntries(
   Object.entries(KIND_CODES).map(([k, v]) => [v, k as BusMessageKind]),

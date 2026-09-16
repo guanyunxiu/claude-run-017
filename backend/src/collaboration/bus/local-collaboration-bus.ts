@@ -25,6 +25,13 @@ export class LocalCollaborationBus extends CollaborationBus {
     _target: string,
   ): Promise<void> {}
   async publishPersisted(_fileId: string, _stateVector: Uint8Array): Promise<void> {}
+  async publishRestorePrepare(_fileId: string, _rid: string): Promise<void> {}
+  async publishRestoreCommit(
+    _fileId: string,
+    _rid: string,
+    _update: Uint8Array,
+  ): Promise<void> {}
+  async publishRestoreAbort(_fileId: string, _rid: string): Promise<void> {}
   async publishKick(_userId: string, _reason: string): Promise<void> {}
 
   async acquireLease(fileId: string): Promise<boolean> {
@@ -36,6 +43,13 @@ export class LocalCollaborationBus extends CollaborationBus {
   }
   async releaseLease(fileId: string): Promise<void> {
     this.ownedLeases.delete(fileId);
+  }
+  async acquireRestoreLock(fileId: string): Promise<boolean> {
+    this.ownedLeases.add(`restore:${fileId}`);
+    return true;
+  }
+  async releaseRestoreLock(fileId: string): Promise<void> {
+    this.ownedLeases.delete(`restore:${fileId}`);
   }
 
   async stop(): Promise<void> {}

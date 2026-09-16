@@ -272,14 +272,21 @@ S3/MinIO
 - While a room is warm, `doc.on('update')` buffers binary updates in memory.
 - Every `PERSIST_FLUSH_MS` the buffer is **merged** (`Y.mergeUpdates`) into one
   ordered row — a 50-keystroke typing burst is one INSERT, not fifty.
-- Every `SNAPSHOT_INTERVAL_MS` (and on idle eviction / graceful shutdown) the
-  whole doc is compacted with `Y.encodeStateAsUpdate` into one S3 object, a
-  `FileSnapshot` row records `lastUpdateId`, and the now-incorporated update
-  rows + previous snapshot object are pruned. Only the newest snapshot is
-  retained. Snapshot scheduling is driven by a counter of *flushed bytes
-  pending compaction* (`bytesAwaitingSnapshot`), **not** by the in-memory
-  buffer — the tick empties that buffer first, so keying off it would starve
-  snapshots for rooms that stay continuously active.
+- Every `SNAPSHOT_INTERVAL_MS` (and on idle eviction / graceful shutdown /
+  version restore) the whole doc is compacted with `Y.encodeStateAsUpdate`
+  into one S3 object and a `FileSnapshot` row records `lastUpdateId`.
+- **History retention.** The newest `FILE_HISTORY_LIMIT` (default 20)
+  snapshots are kept; older snapshot rows AND their S3 objects are deleted.
+  Update-log pruning is aligned with that retention: only update rows covered
+  by the *oldest retained snapshot* (`id <= oldestKept.lastUpdateId`) are
+  deleted. Because every retained snapshot is a fully self-contained
+  `encodeStateAsUpdate`, each historical version can be reconstructed on its
+  own; the update rows between `vN.lastUpdateId` and `vN+1` are kept until
+  `vN` itself ages out. With limit 1 this degenerates to the old behaviour.
+- Snapshot scheduling is driven by a counter of *flushed bytes pending
+  compaction* (`bytesAwaitingSnapshot`), **not** by the in-memory buffer —
+  the tick empties that buffer first, so keying off it would starve snapshots
+  for rooms that stay continuously active.
 - Room load = apply newest S3 snapshot, then apply the tail of
   `DocumentUpdate` rows with `id > lastUpdateId`. Replay uses a private
   transaction origin so replayed updates are never persisted again.
@@ -429,6 +436,52 @@ correctness does not rely on it), and the frontend nginx pointing at that
 gateway. You can reach a single instance directly on host ports 3001/3002 to
 force a browser onto a chosen backend.
 
+### 5.6 Version history & online rollback
+
+Each retained snapshot is a browsable, restorable version.
+
+```
+GET  /api/files/:id/versions                      # any member: list
+GET  /api/files/:id/versions/:version/preview     # any member: read-only text
+POST /api/files/:id/versions/:version/restore     # owner only
+```
+
+**Restore protocol (safe with people typing, across instances).** The
+coordinator (`RoomManager.restoreFileVersion`, invoked by the owner-only REST
+endpoint) runs a short barrier using an exclusive Redis lock
+(`collab:restore:doc:<fileId>`, TTL `RESTORE_LOCK_MS`) so two owners cannot
+restore concurrently:
+
+1. Acquire the restore lock (`409` if one is already running) and read the
+   target snapshot object (`404` if missing).
+2. Warm a local room and flush any already-buffered ordinary edits.
+3. Broadcast `restore-prepare` on the document channel; every warm room
+   (including the coordinator) opens a **barrier**: the periodic tick skips
+   flush/snapshot/eviction/lease churn for that room, and client edits that
+   arrive during the window are applied locally (keeping the y-websocket
+   handshake coherent) but are NOT persisted or fanned over the bus — the
+   reset supersedes them. This is the documented, explicitly-confirmed
+   destructive policy surfaced in the UI's confirm dialog; no edit is silently
+   dropped on the normal editing path.
+4. Wait a short settle window for in-flight doc/awareness frames to drain.
+5. Build ONE canonical reset update — delete the current `content` and insert
+   the target text — seeded from the coordinator's converged document, and
+   write it as a single `DocumentUpdate` row plus a brand-new snapshot
+   (exactly one writer, authorized by the restore lock), so the update log
+   never gains two competing reset rows.
+6. Broadcast `restore-commit` carrying that same reset update. Each room
+   applies it with a dedicated `RESTORE` origin (broadcast to its local
+   sockets but never re-published as an ordinary `doc-update`, so there is no
+   loop), discards its superseded buffers, and leaves the barrier. Online
+   clients — editors and read-only viewers alike — see the document switch
+   instantly, regardless of which backend they are attached to.
+7. Any failure after prepare broadcasts `restore-abort`, rooms resume normal
+   operation, and the lock is released (its TTL is a dead-man's switch).
+
+A new join during or after the barrier loads the fresh snapshot + reset row
+from durable storage normally. Restored content therefore converges for
+online peers **and** survives restarts through the same checkpoint+WAL path.
+
 ---
 
 ## 6. API reference
@@ -460,6 +513,9 @@ GET    /api/files/:id
 PATCH  /api/files/:id                    { name, path? }       (editor+)
 DELETE /api/files/:id                                         (editor+)
 GET    /api/files/:id/content            reconstructed plain text
+GET    /api/files/:id/versions           version list (any member)
+GET    /api/files/:id/versions/:v/preview read-only snapshot text
+POST   /api/files/:id/versions/:v/restore rollback (owner)
 WS     /collab/:fileId?token=...         owner/editor may write, viewer read-only
 ```
 
@@ -467,7 +523,7 @@ WS     /collab/:fileId?token=...         owner/editor may write, viewer read-onl
 
 ## 7. Tests
 
-### 7.1 Backend (71 tests)
+### 7.1 Backend (80 tests)
 
 ```bash
 cd backend && npm test
@@ -499,6 +555,15 @@ cd backend && npm test
   exactly one elected leader (no doubled `DocumentUpdate` rows), identical
   reconstructed content via the REST endpoint, and leader failover after the
   current leader loses its lease.
+- **Version history & restore** (`file-history.spec.ts`,
+  `file-version.service.spec.ts`, plus restore cases in the multi-instance
+  suite): N-snapshot retention with update-log pruning aligned to the oldest
+  kept snapshot; version list/preview permission matrix; owner-only restore
+  (403 for editor/viewer, 404 for missing version); single-instance rollback
+  resets the live client and writes exactly one new snapshot; a restore issued
+  on one backend converges hot rooms AND live y-websocket clients on BOTH
+  backends while peers are typing; a concurrent second restore is rejected by
+  the restore lock.
 
 ### 7.2 Two-browser E2E (Playwright)
 
@@ -532,7 +597,7 @@ JWT/sessions are isolated like two real browsers) and asserts:
 - [x] Reconnect with backoff, dead-peer ping/pong, save/connection indicators,
       permission and sync error toasts
 - [x] Backend unit + HTTP integration + real WebSocket integration tests pass
-      (71/71), including a two-instance cross-backend convergence suite,
+      (80/80), including a two-instance cross-backend convergence suite,
       cross-instance kick, and removed-member read/awareness rejection tests
 - [x] Playwright two-browser E2E provided and Docker-runnable
 - [x] `docker compose up --build` starts TWO backends, an internal load balancer,

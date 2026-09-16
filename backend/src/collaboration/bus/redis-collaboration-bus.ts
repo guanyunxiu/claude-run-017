@@ -9,6 +9,7 @@ import {
   kickChannel,
   KICK_PATTERN,
   lockKey,
+  restoreLockKey,
   type BusMessageHeader,
 } from './collaboration-bus';
 
@@ -53,6 +54,7 @@ export class RedisCollaborationBus extends CollaborationBus {
   private readonly sub: Redis;
   private readonly subscriptions = new Map<string, number>();
   private readonly ownedLocks = new Set<string>();
+  private readonly ownedRestoreLocks = new Set<string>();
   private started = false;
 
   constructor(redis: Redis) {
@@ -123,6 +125,21 @@ export class RedisCollaborationBus extends CollaborationBus {
       case 'persisted':
         this.safeRun((h) => h.onPersisted(fileId, payload, header.i));
         break;
+      case 'restore-prepare':
+        this.safeRun((h) =>
+          h.onRestorePrepare(fileId, header.i, header.rid ?? ''),
+        );
+        break;
+      case 'restore-commit':
+        this.safeRun((h) =>
+          h.onRestoreCommit(fileId, payload, header.i, header.rid ?? ''),
+        );
+        break;
+      case 'restore-abort':
+        this.safeRun((h) =>
+          h.onRestoreAbort(fileId, header.i, header.rid ?? ''),
+        );
+        break;
     }
   }
 
@@ -173,9 +190,21 @@ export class RedisCollaborationBus extends CollaborationBus {
     }
   }
 
-  private async publish(kind: Parameters<typeof encodeBusMessage>[0], fileId: string, payload: Uint8Array, target?: string): Promise<void> {
-    const header: BusMessageHeader = { i: this.instanceId, ...(target ? { t: target } : {}) };
-    await this.pub.publish(docChannel(fileId), encodeBusMessage(kind, payload, header));
+  private async publish(
+    kind: Parameters<typeof encodeBusMessage>[0],
+    fileId: string,
+    payload: Uint8Array,
+    opts: { target?: string; rid?: string } = {},
+  ): Promise<void> {
+    const header: BusMessageHeader = {
+      i: this.instanceId,
+      ...(opts.target ? { t: opts.target } : {}),
+      ...(opts.rid ? { rid: opts.rid } : {}),
+    };
+    await this.pub.publish(
+      docChannel(fileId),
+      encodeBusMessage(kind, payload, header),
+    );
   }
 
   publishDocUpdate(fileId: string, update: Uint8Array): Promise<void> {
@@ -188,10 +217,24 @@ export class RedisCollaborationBus extends CollaborationBus {
     return this.publish('sync-step1', fileId, stateVector);
   }
   publishSyncStep2(fileId: string, update: Uint8Array, targetInstance: string): Promise<void> {
-    return this.publish('sync-step2', fileId, update, targetInstance);
+    return this.publish('sync-step2', fileId, update, { target: targetInstance });
   }
   publishPersisted(fileId: string, stateVector: Uint8Array): Promise<void> {
     return this.publish('persisted', fileId, stateVector);
+  }
+
+  publishRestorePrepare(fileId: string, rid: string): Promise<void> {
+    return this.publish('restore-prepare', fileId, new Uint8Array(0), { rid });
+  }
+  publishRestoreCommit(
+    fileId: string,
+    rid: string,
+    resetUpdate: Uint8Array,
+  ): Promise<void> {
+    return this.publish('restore-commit', fileId, resetUpdate, { rid });
+  }
+  publishRestoreAbort(fileId: string, rid: string): Promise<void> {
+    return this.publish('restore-abort', fileId, new Uint8Array(0), { rid });
   }
 
   async publishKick(userId: string, reason: string): Promise<void> {
@@ -252,11 +295,41 @@ export class RedisCollaborationBus extends CollaborationBus {
     }
   }
 
+  async acquireRestoreLock(fileId: string, ttlMs: number): Promise<boolean> {
+    const res = (await this.pub.eval(
+      LUA_ACQUIRE,
+      1,
+      restoreLockKey(fileId),
+      this.instanceId,
+      String(ttlMs),
+    )) as string | null;
+    const owned = res === 'OK';
+    if (owned) this.ownedRestoreLocks.add(fileId);
+    return owned;
+  }
+
+  async releaseRestoreLock(fileId: string): Promise<void> {
+    if (!this.ownedRestoreLocks.has(fileId)) return;
+    this.ownedRestoreLocks.delete(fileId);
+    try {
+      await this.pub.eval(
+        LUA_RELEASE,
+        1,
+        restoreLockKey(fileId),
+        this.instanceId,
+      );
+    } catch (err) {
+      this.logger.warn(`restore lock release failed: ${(err as Error).message}`);
+    }
+  }
+
   async stop(): Promise<void> {
     // Release everything this instance owned so another backend takes over
     // immediately instead of waiting for the TTL to expire.
     const files = [...this.ownedLocks];
     await Promise.all(files.map((f) => this.releaseLease(f)));
+    const restores = [...this.ownedRestoreLocks];
+    await Promise.all(restores.map((f) => this.releaseRestoreLock(f)));
     this.pub.disconnect();
     this.sub.disconnect();
   }

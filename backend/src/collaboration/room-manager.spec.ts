@@ -27,6 +27,21 @@ class FakePrisma {
       this.snapshots
         .filter((s) => s.fileId === where.fileId)
         .sort((a, b) => b.version - a.version)[0] ?? null,
+    findMany: async (args: {
+      where?: { fileId?: string; version?: { lt?: number } };
+      orderBy?: { version?: 'asc' | 'desc' };
+      take?: number;
+    } = {}) => {
+      let rows = [...this.snapshots];
+      if (args.where?.fileId) rows = rows.filter((s) => s.fileId === args.where!.fileId);
+      if (args.where?.version?.lt !== undefined)
+        rows = rows.filter((s) => s.version < args.where!.version!.lt!);
+      rows.sort((a, b) =>
+        args.orderBy?.version === 'asc' ? a.version - b.version : b.version - a.version,
+      );
+      if (args.take) rows = rows.slice(0, args.take);
+      return rows;
+    },
     create: async ({ data }: { data: Omit<UpdateRow, never> | Record<string, unknown> }) => {
       const row = { id: `snap-${this.snapshots.length}`, ...(data as object) } as never;
       this.snapshots.push(row as never);

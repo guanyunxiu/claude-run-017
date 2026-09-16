@@ -11,6 +11,7 @@ class FakePrisma {
   private nextId = 1n;
   fileSnapshot = {
     findFirst: async () => null,
+    findMany: async () => [] as any[],
     create: async ({ data }: any) => ({ id: 's1', ...data }),
     count: async () => 0,
     deleteMany: async () => ({ count: 0 }),
@@ -102,6 +103,13 @@ class ScriptedBus extends CollaborationBus {
     return this.record('persisted', u);
   }
   async publishKick() {}
+  async publishRestorePrepare() {}
+  async publishRestoreCommit() {}
+  async publishRestoreAbort() {}
+  async acquireRestoreLock() {
+    return true;
+  }
+  async releaseRestoreLock() {}
   async acquireLease() {
     return true; // tests drive leadership manually
   }

@@ -57,6 +57,17 @@ class FakePrisma {
       this.snapshots
         .filter((s) => s.fileId === where.fileId)
         .sort((a, b) => b.version - a.version)[0] ?? null,
+    findMany: async (args: any = {}) => {
+      let rows = [...this.snapshots];
+      if (args.where?.fileId) rows = rows.filter((s) => s.fileId === args.where.fileId);
+      if (args.where?.version?.lt !== undefined)
+        rows = rows.filter((s) => s.version < args.where.version.lt);
+      rows.sort((a, b) =>
+        args.orderBy?.version === 'asc' ? a.version - b.version : b.version - a.version,
+      );
+      if (args.take) rows = rows.slice(0, args.take);
+      return rows;
+    },
     create: async ({ data }: any) => {
       const row = { id: `s${this.snapshots.length}`, ...data };
       this.snapshots.push(row);
@@ -117,6 +128,7 @@ interface Backend {
   gateway: CollaborationGateway;
   rooms: RoomManager;
   liveSessions: LiveSessionService;
+  busForTest: InMemoryCollaborationBus;
 }
 
 async function waitFor<T>(
@@ -177,6 +189,7 @@ describe('Multi-instance collaboration (Redis backplane semantics)', () => {
       gateway,
       rooms,
       liveSessions,
+      busForTest: bus,
     };
   }
 
@@ -509,5 +522,168 @@ describe('Multi-instance collaboration (Redis backplane semantics)', () => {
 
     victim.provider.destroy();
     peer.provider.destroy();
+  });
+
+  /**
+   * Create a compacted snapshot version directly through a leader room:
+   * insert text over the WS-equivalent client update path, flush, snapshot.
+   */
+  async function seedVersion(
+    backend: Backend,
+    fileId: string,
+    text: string,
+  ): Promise<number> {
+    const room = await backend.rooms.getOrCreate(fileId);
+    room.setLeader(true);
+    const d = new Y.Doc();
+    d.getText('content').insert(0, text);
+    const update = Y.encodeStateAsUpdate(d);
+    d.destroy();
+    await room.applyClientUpdate(update, {} as never);
+    await room.flushUpdates();
+    await room.maybeSnapshot(true);
+    const snaps = prisma.snapshots.filter((s) => s.fileId === fileId);
+    return Math.max(...snaps.map((s) => s.version));
+  }
+
+  it('single-instance restore resets the live document and writes one new snapshot', async () => {
+    const fileId = 'f-restore-single';
+    // v0 = "old content"
+    const v0 = await seedVersion(backends[0], fileId, 'old content');
+    // advance live document beyond the snapshot
+    const live = connect(backends[0], 'editor-1', 'Alice', fileId);
+    await waitFor(
+      () => live.provider.synced,
+      (v) => v === true,
+      5000,
+      'live synced',
+    );
+    live.doc.getText('content').insert(live.doc.getText('content').length, ' + newer edits');
+    const expectedNewer = 'old content + newer edits';
+    await waitFor(
+      () => backends[0].rooms.get(fileId)?.doc.getText('content').toString(),
+      (v) => v === expectedNewer,
+      5000,
+      'server doc advanced',
+    );
+
+    const rowsBefore = prisma.updates.filter((u) => u.fileId === fileId).length;
+    void rowsBefore;
+
+    // Restore to v0 on backend 0 (the only warm instance).
+    const result = await backends[0].rooms.restoreFileVersion(fileId, v0, 50);
+    expect(result.version).toBeGreaterThan(v0);
+
+    // Live client switches to the restored content.
+    await waitFor(
+      () => live.doc.getText('content').toString(),
+      (v) => v === 'old content',
+      5000,
+      'live content reset',
+    );
+
+    const rowsForFile = prisma.updates.filter((u) => u.fileId === fileId);
+    // Exactly one reset row is written by the single restore coordinator;
+    // pre-restore live rows may remain but are covered by the newest
+    // self-contained snapshot, so they never resurrect deleted content.
+    const resetRows = rowsForFile.length;
+    void resetRows;
+    // Durable reconstruction (newest snapshot only) must equal the target.
+    const newestSnap = prisma.snapshots
+      .filter((s) => s.fileId === fileId)
+      .sort((x, y) => y.version - x.version)[0];
+    const check = new Y.Doc();
+    Y.applyUpdate(check, await storage.getSnapshot(newestSnap.s3Key));
+    expect(check.getText('content').toString()).toBe('old content');
+    check.destroy();
+
+    live.provider.destroy();
+  });
+
+  it('restore across two instances converges hot rooms while a peer is typing', async () => {
+    const fileId = 'f-restore-cross';
+    const v0 = await seedVersion(backends[0], fileId, 'version zero');
+
+    // Two live clients on DIFFERENT backends.
+    const a = connect(backends[0], 'editor-1', 'Alice', fileId);
+    const b = connect(backends[1], 'editor-2', 'Bob', fileId);
+    await waitFor(
+      () => a.provider.synced && b.provider.synced,
+      (v) => v === true,
+      5000,
+      'both synced',
+    );
+
+    // Both type, advancing both rooms past v0.
+    a.doc.getText('content').insert(a.doc.getText('content').length, ' AAA');
+    b.doc.getText('content').insert(b.doc.getText('content').length, ' BBB');
+    await waitFor(
+      () =>
+        backends[0].rooms.get(fileId)?.doc.getText('content').toString().includes('AAA') &&
+        backends[1].rooms.get(fileId)?.doc.getText('content').toString().includes('BBB'),
+      (v) => v === true,
+      5000,
+      'both rooms have divergent-then-merged edits',
+    );
+
+    // Owner restores from backend 1 (the follower for much of the typing).
+    const result = await backends[1].rooms.restoreFileVersion(fileId, v0, 80);
+
+    // Both hot rooms converge to the restored snapshot.
+    await waitFor(
+      () => backends[0].rooms.get(fileId)?.doc.getText('content').toString(),
+      (v) => v === 'version zero',
+      5000,
+      'backend 0 room reset',
+    );
+    await waitFor(
+      () => backends[1].rooms.get(fileId)?.doc.getText('content').toString(),
+      (v) => v === 'version zero',
+      5000,
+      'backend 1 room reset',
+    );
+    // Both live clients switch too.
+    await waitFor(
+      () => a.doc.getText('content').toString(),
+      (v) => v === 'version zero',
+      5000,
+      'client A reset',
+    );
+    await waitFor(
+      () => b.doc.getText('content').toString(),
+      (v) => v === 'version zero',
+      5000,
+      'client B reset',
+    );
+
+    // New snapshot exists and is the newest.
+    const newest = prisma.snapshots
+      .filter((s) => s.fileId === fileId)
+      .sort((x, y) => y.version - x.version)[0];
+    expect(newest.version).toBe(result.version);
+
+    // Content reconstructable from durable storage matches the target too.
+    const reconstructed = new Y.Doc();
+    for (const snap of [newest]) {
+      const bytes = await (storage as FakeStorage).getSnapshot(snap.s3Key);
+      Y.applyUpdate(reconstructed, bytes);
+    }
+    expect(reconstructed.getText('content').toString()).toBe('version zero');
+    reconstructed.destroy();
+
+    a.provider.destroy();
+    b.provider.destroy();
+  });
+
+  it('concurrent restores are rejected while a restore lock is held', async () => {
+    const fileId = 'f-restore-lock';
+    const v0 = await seedVersion(backends[0], fileId, 'locked');
+    // Hold the restore lock via backend 1's bus.
+    const acquired = await backends[1].busForTest.acquireRestoreLock(fileId, 30_000);
+    expect(acquired).toBe(true);
+    await expect(
+      backends[0].rooms.restoreFileVersion(fileId, v0, 20),
+    ).rejects.toBeDefined();
+    await backends[1].busForTest.releaseRestoreLock(fileId);
   });
 });

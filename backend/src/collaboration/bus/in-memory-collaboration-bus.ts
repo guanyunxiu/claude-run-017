@@ -80,6 +80,12 @@ export class InMemoryCollaborationBus extends CollaborationBus {
       this.h.onSyncStep2(fileId, payload, this.instanceId, header.i);
     else if (kind === 'persisted')
       this.h.onPersisted(fileId, payload, header.i);
+    else if (kind === 'restore-prepare')
+      this.h.onRestorePrepare(fileId, header.i, header.rid ?? '');
+    else if (kind === 'restore-commit')
+      this.h.onRestoreCommit(fileId, payload, header.i, header.rid ?? '');
+    else if (kind === 'restore-abort')
+      this.h.onRestoreAbort(fileId, header.i, header.rid ?? '');
   }
 
   async unsubscribe(fileId: string): Promise<void> {
@@ -116,6 +122,34 @@ export class InMemoryCollaborationBus extends CollaborationBus {
   publishPersisted(fileId: string, stateVector: Uint8Array): Promise<void> {
     return this.send(fileId, this.frame('persisted', stateVector, {}));
   }
+  publishRestorePrepare(fileId: string, rid: string): Promise<void> {
+    return this.send(fileId, this.frame('restore-prepare', new Uint8Array(0), { rid }));
+  }
+  publishRestoreCommit(fileId: string, rid: string, update: Uint8Array): Promise<void> {
+    return this.send(fileId, this.frame('restore-commit', update, { rid }));
+  }
+  publishRestoreAbort(fileId: string, rid: string): Promise<void> {
+    return this.send(fileId, this.frame('restore-abort', new Uint8Array(0), { rid }));
+  }
+  async acquireRestoreLock(fileId: string, ttlMs: number): Promise<boolean> {
+    const key = `collab:restore:doc:${fileId}`;
+    const lock = InMemoryCollaborationBus.locks.get(key);
+    const now = this.now();
+    if (!lock || lock.expiresAt <= now || lock.owner === this.instanceId) {
+      InMemoryCollaborationBus.locks.set(key, {
+        owner: this.instanceId,
+        expiresAt: now + ttlMs,
+      });
+      return true;
+    }
+    return false;
+  }
+  async releaseRestoreLock(fileId: string): Promise<void> {
+    const key = `collab:restore:doc:${fileId}`;
+    if (InMemoryCollaborationBus.locks.get(key)?.owner === this.instanceId) {
+      InMemoryCollaborationBus.locks.delete(key);
+    }
+  }
 
   async publishKick(userId: string, reason: string): Promise<void> {
     // Redis delivers to ALL subscribers except via instance-id filtering;
@@ -127,7 +161,7 @@ export class InMemoryCollaborationBus extends CollaborationBus {
     }
   }
 
-  private frame(kind: BusMessageKind, payload: Uint8Array, extra: { t?: string }): Buffer {
+  private frame(kind: BusMessageKind, payload: Uint8Array, extra: { t?: string; rid?: string }): Buffer {
     return encodeBusMessage(kind, payload, { i: this.instanceId, ...extra });
   }
 
