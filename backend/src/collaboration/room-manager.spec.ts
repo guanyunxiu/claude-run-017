@@ -192,4 +192,63 @@ describe('Room persistence', () => {
     expect(merged).toContain('-one');
     expect(merged).toContain('-two');
   });
+
+  it('schedules snapshots from persisted (flushed) updates, not the now-empty buffer', async () => {
+    // Regression for: tick flushed/emptied the buffer, then snapshot was only
+    // due when buffer.length > 0 -> continuously active rooms never compacted.
+    const { room, prisma, storage } = makeRoom(50, 0);
+    await room.ensureLoaded();
+
+    room.doc.getText('content').insert(0, 'round one');
+    await room.flushUpdates(); // buffer is now empty, data is in Postgres
+
+    // Interval elapsed AND there are flushed updates not yet snapshotted.
+    expect(room.shouldSnapshot(Date.now() + 1)).toBe(true);
+    expect(await room.maybeSnapshot()).toBe(true);
+    expect(storage.objects.size).toBe(1);
+    expect(prisma.updates).toHaveLength(0); // tail pruned
+
+    // Once compacted, there is nothing newer to snapshot.
+    expect(room.shouldSnapshot(Date.now() + 1000)).toBe(false);
+    expect(await room.maybeSnapshot(true)).toBe(false);
+
+    // New edits after a snapshot become due again.
+    room.doc.getText('content').insert(99, ' round two');
+    await room.flushUpdates();
+    expect(room.shouldSnapshot(Date.now() + 1)).toBe(true);
+  });
+
+  it('persistAllForEviction retains updates if flush fails and keeps them if snapshot fails', async () => {
+    const prisma = new FakePrisma();
+    const storage = new FakeStorage();
+    const room = new Room(
+      'f1',
+      prisma as never,
+      storage as never,
+      new FakePresence() as never,
+      50,
+      1_000_000,
+    );
+    await room.ensureLoaded();
+    room.doc.getText('content').insert(0, 'precious edits');
+    expect(room.getBufferedCount()).toBe(1);
+
+    // Postgres outage: flush throws and the buffer must be restored.
+    const origCreate = prisma.documentUpdate.create;
+    prisma.documentUpdate.create = async () => {
+      throw new Error('postgres down');
+    };
+    await expect(room.persistAllForEviction()).rejects.toThrow('postgres down');
+    expect(room.getBufferedCount()).toBe(1); // nothing lost
+    prisma.documentUpdate.create = origCreate;
+
+    // Recovery: flush succeeds; a snapshot failure must not block eviction
+    // because the update log in Postgres is already durable.
+    storage.putSnapshot = async () => {
+      throw new Error('s3 down');
+    };
+    await expect(room.persistAllForEviction()).resolves.toBeUndefined();
+    expect(room.getBufferedCount()).toBe(0);
+    expect(prisma.updates.length).toBe(1); // safely in Postgres, awaiting later compaction
+  });
 });

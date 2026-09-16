@@ -38,6 +38,13 @@ export function useYFile({
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [lastSavedAt, setLastSavedAt] = useState<number | null>(null);
   const [presentUsers, setPresentUsers] = useState<PresenceUser[]>([]);
+  /**
+   * Set when the server rejects an edit on a live connection (e.g. the owner
+   * downgraded this user to viewer after the socket was already open). The
+   * editor flips to read-only immediately without waiting for a reconnect.
+   */
+  const [serverReadonly, setServerReadonly] = useState(false);
+  const [accessRevoked, setAccessRevoked] = useState(false);
 
   // Stable refs for callbacks to avoid recreating the provider.
   const callbacksRef = useRef({ onPermissionDenied });
@@ -51,6 +58,8 @@ export function useYFile({
     setConnection('connecting');
     setSaveStatus('idle');
     setPresentUsers([]);
+    setServerReadonly(false);
+    setAccessRevoked(false);
 
     const provider = new WebsocketProvider(
       collaborationUrl(),
@@ -128,6 +137,7 @@ export function useYFile({
           const now = Date.now();
           if (now - lastDenialAt.current > 4000) {
             lastDenialAt.current = now;
+            setServerReadonly(true);
             callbacksRef.current.onPermissionDenied?.(
               reason || 'You do not have permission to edit this file',
             );
@@ -144,6 +154,22 @@ export function useYFile({
       if (currentWs && !attachedSockets.has(currentWs)) {
         attachedSockets.add(currentWs);
         currentWs.addEventListener('message', rawMessageListener as EventListener);
+        // 1008 = policy violation: the server closes with this when access to
+        // the document is revoked for a live connection.
+        currentWs.addEventListener('close', ((event: { code?: number; reason?: string }) => {
+          if (event.code === 1008) {
+            setAccessRevoked(true);
+            setServerReadonly(true);
+            callbacksRef.current.onPermissionDenied?.(
+              event.reason || 'Your access to this document was revoked',
+            );
+            try {
+              provider.disconnect();
+            } catch {
+              // ignore
+            }
+          }
+        }) as EventListener);
       }
     }, 50);
 
@@ -221,6 +247,10 @@ export function useYFile({
     saveStatus,
     lastSavedAt,
     presentUsers,
+    /** true once the server rejects an edit on this live connection */
+    serverReadonly,
+    /** true once the server reports access revoked (close 1008) */
+    accessRevoked,
     forceReconnect,
   };
 }

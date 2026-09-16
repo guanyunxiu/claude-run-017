@@ -76,7 +76,6 @@ export default function ProjectPage() {
     [files, activeFileId],
   );
   const myRole = project?.role ?? 'viewer';
-  const canEdit = myRole !== 'viewer';
 
   const onPermissionDenied = useCallback(
     (reason: string) => {
@@ -90,6 +89,18 @@ export default function ProjectPage() {
     currentUser: user!,
     onPermissionDenied,
   });
+
+  // Effective role for the currently open file: a server-side downgrade on a
+  // live socket demotes this session to viewer without a page reload.
+  const effectiveFileRole: typeof myRole = collab.serverReadonly
+    ? 'viewer'
+    : myRole;
+  const canEdit = effectiveFileRole !== 'viewer';
+  const readOnlyReason = collab.serverReadonly
+    ? myRole === 'viewer'
+      ? 'You have viewer access. Editing is disabled, but you can follow live changes and cursors.'
+      : 'Your edit access was changed to viewer while this document was open. Reopen the project to regain it if restored.'
+    : 'You have viewer access. Editing is disabled, but you can follow live changes and cursors.';
 
   // Open file -------------------------------------------------------------
   function openFile(file: FileNode) {
@@ -257,8 +268,13 @@ export default function ProjectPage() {
               )}
               {!canEdit && (
                 <div className="readonly-note" data-testid="readonly-note">
-                  You have viewer access. Editing is disabled, but you can follow
-                  live changes and cursors.
+                  {readOnlyReason}
+                </div>
+              )}
+              {collab.accessRevoked && (
+                <div className="readonly-note" data-testid="access-revoked-note">
+                  Your access to this document was revoked. Ask the project owner
+                  to add you again, then reopen the file.
                 </div>
               )}
               <div className="editor-host">

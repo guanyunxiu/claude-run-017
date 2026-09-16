@@ -64,6 +64,14 @@ export class Room {
   /** highest DocumentUpdate.id already incorporated into this in-memory doc */
   private persistedUpToId: bigint | null = null;
   private hasEverBeenPersisted = false;
+  /**
+   * Bytes of document updates persisted to Postgres since the last S3
+   * compaction. A snapshot is due once this is non-zero AND the interval
+   * elapsed. We must not key scheduling off `buffer.length`: the tick flushes
+   * (and empties) that buffer *before* checking the snapshot condition, which
+   * would otherwise starve snapshots for continuously active rooms.
+   */
+  private bytesAwaitingSnapshot = 0;
 
   constructor(
     public readonly documentId: string,
@@ -225,6 +233,7 @@ export class Room {
       });
       this.persistedUpToId = row.id;
       this.hasEverBeenPersisted = true;
+      this.bytesAwaitingSnapshot += merged.byteLength;
       this.lastFlush = Date.now();
       this.logger.debug(
         `Flushed ${entries.length} update(s), ${merged.byteLength} bytes (unmerged ${byteCount})`,
@@ -245,6 +254,10 @@ export class Room {
   /**
    * Compact the active document into a fresh S3 snapshot and prune the update
    * tail. We retain only the newest snapshot per file.
+   *
+   * Scheduling is based on `bytesAwaitingSnapshot` (Postgres updates accumulated
+   * since the previous snapshot), NOT on the in-memory buffer, because the
+   * periodic tick flushes that buffer first.
    */
   async maybeSnapshot(force = false): Promise<boolean> {
     const due = force || Date.now() - this.lastSnapshot >= this.snapshotMs;
@@ -252,8 +265,8 @@ export class Room {
     if (this.buffer.length > 0) {
       await this.flushUpdates();
     }
-    if (!this.hasEverBeenPersisted) {
-      // Nothing meaningful has ever happened yet; retry later.
+    if (this.bytesAwaitingSnapshot === 0) {
+      // Nothing newer than the previous snapshot; retry later.
       this.lastSnapshot = Date.now();
       return false;
     }
@@ -265,6 +278,8 @@ export class Room {
     });
     const version = previous ? previous.version + 1 : 0;
     const key = this.storage.snapshotKey(this.documentId, version);
+    // Upload first: if this fails we throw before any metadata change and the
+    // next attempt retries cleanly with the update log still intact.
     await this.storage.putSnapshot(key, state);
 
     const upToId = this.persistedUpToId ? Number(this.persistedUpToId) : 0;
@@ -280,22 +295,36 @@ export class Room {
     });
 
     if (upToId > 0) {
-      await this.prisma.documentUpdate.deleteMany({
-        where: {
-          fileId: this.documentId,
-          id: { lte: BigInt(upToId) },
-        },
-      });
+      try {
+        await this.prisma.documentUpdate.deleteMany({
+          where: {
+            fileId: this.documentId,
+            id: { lte: BigInt(upToId) },
+          },
+        });
+      } catch (err) {
+        // The new snapshot already covers these rows (load reads only
+        // id > lastUpdateId), so leaving them behind is harmless; they are
+        // pruned by the next snapshot. Do not fail/roll back the snapshot.
+        this.logger.warn(
+          `Snapshot taken but pruning the update tail failed: ${(err as Error).message}`,
+        );
+      }
     }
     if (previous) {
       try {
         await this.storage.deleteSnapshot(previous.s3Key);
       } catch {
-        // best effort - newest snapshot is what matters
+        // best effort - the newest snapshot is what loaders pick
       }
-      await this.prisma.fileSnapshot.deleteMany({ where: { id: previous.id } });
+      try {
+        await this.prisma.fileSnapshot.deleteMany({ where: { id: previous.id } });
+      } catch {
+        // an older snapshot row is harmless; loader orders by version desc
+      }
     }
 
+    this.bytesAwaitingSnapshot = 0;
     this.lastSnapshot = Date.now();
     this.logger.log(
       `Snapshot v${version} written (${state.byteLength} bytes, upToUpdate=${upToId})`,
@@ -308,10 +337,45 @@ export class Room {
   }
 
   shouldSnapshot(now: number = Date.now()): boolean {
+    // Due once the interval has elapsed AND there are persisted updates not
+    // yet captured by a snapshot. Continuously active rooms must compact too.
     return (
-      this.buffer.length > 0 &&
+      this.bytesAwaitingSnapshot > 0 &&
       now - this.lastSnapshot >= this.snapshotMs
     );
+  }
+
+  /**
+   * Durability barrier used before a room is destroyed/evicted.
+   *
+   * MUST leave no buffered updates only in memory. Postgres flush success is
+   * the hard requirement: once committed there, reconnecting clients can
+   * reconstruct the document from the update log even if the S3 compaction
+   * below fails. The snapshot itself is best-effort here - a failure is
+   * logged but does not block eviction (and leaves the committed update rows
+   * to be compacted by the next room instance).
+   */
+  async persistAllForEviction(): Promise<void> {
+    // Loop because flushUpdates is not re-entrant-safe across concurrent
+    // calls and new edits can theoretically land right before the last flush.
+    await this.flushUpdates();
+    if (this.bytesAwaitingSnapshot > 0) {
+      try {
+        await this.maybeSnapshot(true);
+      } catch (err) {
+        // The committed update rows in Postgres are still the source of truth
+        // until a snapshot supersedes them; the next room instance compacts.
+        this.logger.warn(
+          `Snapshot during eviction failed (updates are safe in Postgres): ${(err as Error).message}`,
+        );
+      }
+    }
+    // Final guard: if the snapshot attempt did not throw but also could not
+    // compact (should not happen with force), make sure nothing remains only
+    // in the in-memory buffer.
+    if (this.buffer.length > 0) {
+      await this.flushUpdates();
+    }
   }
 
   /**
@@ -367,7 +431,14 @@ export class RoomManager implements OnModuleDestroy {
   private readonly flushMs: number;
   private readonly snapshotMs: number;
   private readonly ttlMs: number;
-  private readonly timer: NodeJS.Timeout;
+  private readonly timer: NodeJS.Timeout | null;
+  /**
+   * Rooms whose eviction failed (Postgres/S3 unavailable). They stay in the
+   * map with their Y.Doc and unflushed buffer intact and are retried after a
+   * cooldown instead of being dropped (which would silently revert the doc).
+   */
+  private readonly evictionRetryAt = new Map<string, number>();
+  private static readonly EVICTION_RETRY_DELAY_MS = 5_000;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -378,11 +449,18 @@ export class RoomManager implements OnModuleDestroy {
     this.flushMs = config.get<number>('PERSIST_FLUSH_MS', 5000);
     this.snapshotMs = config.get<number>('SNAPSHOT_INTERVAL_MS', 60000);
     this.ttlMs = config.get<number>('ROOM_TTL_MS', 60000);
-    this.timer = setInterval(() => {
-      void this.tick();
-    }, Math.min(this.flushMs, 1000));
-    // Do not keep the process alive solely for the interval.
-    this.timer.unref?.();
+    // Production runs the background persistence loop. Tests disable it
+    // (COLLAB_AUTO_PERSIST=false) so timers cannot race the assertions and
+    // evict rooms mid-scenario.
+    if (config.get<boolean>('COLLAB_AUTO_PERSIST', true)) {
+      this.timer = setInterval(() => {
+        void this.tick();
+      }, Math.min(this.flushMs, 1000));
+      // Do not keep the process alive solely for the interval.
+      this.timer.unref?.();
+    } else {
+      this.timer = null;
+    }
   }
 
   async getOrCreate(documentId: string): Promise<Room> {
@@ -410,48 +488,88 @@ export class RoomManager implements OnModuleDestroy {
     return this.rooms.size;
   }
 
+  /** Test hook: run exactly one persistence + eviction pass. */
+  async runIdleSweepForTest(): Promise<void> {
+    await this.tick();
+  }
+
+  /** Test hook: clear eviction retry cooldowns. */
+  resetRetryCooldownForTest(id?: string): void {
+    if (id) this.evictionRetryAt.delete(id);
+    else this.evictionRetryAt.clear();
+  }
+
   private async tick(): Promise<void> {
     const now = Date.now();
     for (const [id, room] of this.rooms) {
       try {
+        // Durability runs for every room, busy or idle.
         if (room.shouldFlush(now)) {
           await room.flushUpdates();
         }
         if (room.shouldSnapshot(now)) {
           await room.maybeSnapshot();
         }
-        if (room.isIdle(this.ttlMs)) {
-          await this.evict(id);
-        }
       } catch (err) {
-        this.logger.error(`Tick failed for ${id}: ${(err as Error).message}`);
+        // Persistence is unavailable right now. The buffered updates stay in
+        // memory and are retried on the next tick; nothing is discarded.
+        this.logger.error(
+          `Persistence tick failed for ${id}: ${(err as Error).message}`,
+        );
+      }
+
+      try {
+        if (!room.isIdle(this.ttlMs)) continue;
+        const retryAt = this.evictionRetryAt.get(id);
+        if (retryAt !== undefined && now < retryAt) continue;
+        await this.evict(id);
+      } catch (err) {
+        this.logger.error(
+          `Eviction failed for ${id}; keeping room in memory to retry: ${(err as Error).message}`,
+        );
+        this.evictionRetryAt.set(
+          id,
+          Date.now() + RoomManager.EVICTION_RETRY_DELAY_MS,
+        );
       }
     }
   }
 
+  /**
+   * Evict an idle room. The in-memory Y.Doc is destroyed and the room is
+   * removed from the map ONLY after every buffered update has been durably
+   * flushed to Postgres (and compacted into S3). Any failure propagates so
+   * the caller keeps the room and retries later - never silently dropping
+   * edits and reverting reconnecting clients to an older document.
+   */
   private async evict(id: string): Promise<void> {
     const room = this.rooms.get(id);
     if (!room) return;
-    try {
-      await room.flushUpdates();
-      await room.maybeSnapshot(true);
-      room.doc.destroy();
-      this.logger.log(`Evicted idle room ${id}`);
-    } catch (err) {
-      this.logger.error(`Eviction failed for ${id}: ${(err as Error).message}`);
-    } finally {
-      this.rooms.delete(id);
-    }
+    await room.persistAllForEviction();
+    room.doc.destroy();
+    this.rooms.delete(id);
+    this.evictionRetryAt.delete(id);
+    this.logger.log(`Evicted idle room ${id}`);
   }
 
   async flushAll(): Promise<void> {
+    // Used on graceful shutdown. Best effort per room: log failures but
+    // attempt every document; a failed one is simply abandoned with the
+    // process (its in-memory edits were rebroadcast and are retried while
+    // the process keeps running until shutdown is forced).
     for (const [id] of this.rooms) {
-      await this.evict(id);
+      try {
+        await this.evict(id);
+      } catch (err) {
+        this.logger.error(
+          `Shutdown flush failed for ${id}: ${(err as Error).message}`,
+        );
+      }
     }
   }
 
   async onModuleDestroy(): Promise<void> {
-    clearInterval(this.timer);
+    if (this.timer) clearInterval(this.timer);
     await this.flushAll();
   }
 }

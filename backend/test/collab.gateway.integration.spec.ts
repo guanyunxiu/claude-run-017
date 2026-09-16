@@ -4,7 +4,7 @@ import { WebSocket as WsWebSocket } from 'ws';
 import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { CollaborationGateway } from '../src/collaboration/collaboration.gateway';
-import { RoomManager } from '../src/collaboration/room-manager';
+import { Room, RoomManager } from '../src/collaboration/room-manager';
 import { PresenceService } from '../src/collaboration/presence.service';
 import { PermissionService } from '../src/projects/permission.service';
 
@@ -35,9 +35,19 @@ class FakePrisma {
       this.updates
         .filter((u) => u.fileId === where.fileId)
         .sort((a, b) => (a.id < b.id ? -1 : 1)),
-    deleteMany: async () => {
-      this.updates = [];
-      return { count: 0 };
+    deleteMany: async ({
+      where,
+    }: {
+      where?: { fileId?: string; id?: { lte?: bigint } };
+    } = {}) => {
+      const before = this.updates.length;
+      this.updates = this.updates.filter((u) => {
+        if (where?.fileId && u.fileId === where.fileId) {
+          return where.id?.lte !== undefined && u.id > where.id.lte;
+        }
+        return true;
+      });
+      return { count: before - this.updates.length };
     },
   };
 
@@ -90,7 +100,20 @@ class FakeRedis {
 }
 
 class FakePermissions {
-  roleFor(userId: string): 'owner' | 'editor' | 'viewer' | null {
+  /**
+   * `${fileId}:${userId}` -> role. An explicit null means access was revoked
+   * (must NOT fall through to the built-in default roles).
+   */
+  roles = new Map<string, 'owner' | 'editor' | 'viewer' | null>();
+
+  setRole(fileId: string, userId: string, role: 'owner' | 'editor' | 'viewer' | null) {
+    this.roles.set(`${fileId}:${userId}`, role);
+  }
+
+  roleFor(fileId: string, userId: string): 'owner' | 'editor' | 'viewer' | null {
+    if (this.roles.has(`${fileId}:${userId}`)) {
+      return this.roles.get(`${fileId}:${userId}`) ?? null;
+    }
     if (userId === 'owner-1') return 'owner';
     if (userId === 'editor-1' || userId === 'editor-2') return 'editor';
     if (userId === 'viewer-1') return 'viewer';
@@ -98,7 +121,7 @@ class FakePermissions {
   }
 
   async getFileRole(fileId: string, userId: string) {
-    const role = this.roleFor(userId);
+    const role = this.roleFor(fileId, userId);
     return role ? { role, file: { id: fileId, projectId: 'p1' } } : null;
   }
 }
@@ -130,11 +153,13 @@ describe('Collaboration WebSocket gateway (integration)', () => {
   let prisma: FakePrisma;
   let storage: FakeStorage;
   let jwt: JwtService;
+  let permissions: FakePermissions;
 
   beforeAll(async () => {
     jwt = new JwtService({ secret: 'test-secret' });
     prisma = new FakePrisma();
     storage = new FakeStorage();
+    permissions = new FakePermissions();
     const presence = new PresenceService(
       new FakeRedis() as never,
       { get: (_k: string, d: number) => d } as never,
@@ -143,12 +168,27 @@ describe('Collaboration WebSocket gateway (integration)', () => {
       prisma as never,
       storage as never,
       presence,
-      { get: (_k: string, d: number) => d } as never,
+      // Tests drive persistence explicitly via runIdleSweepForTest(); the
+      // background timer is disabled so it cannot evict rooms mid-scenario.
+      {
+        get: (key: string, d: number | boolean) =>
+          key === 'PERSIST_FLUSH_MS'
+            ? 50
+            : key === 'SNAPSHOT_INTERVAL_MS'
+              ? 300
+              : key === 'ROOM_TTL_MS'
+                ? 300
+                : key === 'COLLAB_AUTO_PERSIST'
+                  ? false
+                  : d,
+      } as never,
     );
     gateway = new CollaborationGateway(
       jwt,
-      new FakePermissions() as unknown as PermissionService,
+      permissions as unknown as PermissionService,
       rooms,
+      // Zero role cache: a downgrade applies to the very next edit frame.
+      { get: (key: string, d: number) => (key === 'ROLE_CACHE_MS' ? 0 : d) } as never,
     );
 
     httpServer = createServer();
@@ -390,5 +430,179 @@ describe('Collaboration WebSocket gateway (integration)', () => {
     );
 
     b.provider.destroy();
+  });
+
+  it('applies a live role downgrade without the client reconnecting', async () => {
+    const roomId = 'r-downgrade';
+    const editor = connectClient('editor-1', 'Alice', '#f44336', roomId);
+    const peer = connectClient('editor-2', 'Bob', '#2196f3', roomId);
+    await waitFor(
+      () => editor.provider.synced && peer.provider.synced,
+      (v) => v === true,
+      5000,
+      'both synced',
+    );
+
+    // Initially the editor can mutate the shared document.
+    editor.doc.getText('content').insert(0, 'before downgrade\n');
+    await waitFor(
+      () => peer.doc.getText('content').toString(),
+      (v) => v.includes('before downgrade'),
+      4000,
+      'peer receives edit before downgrade',
+    );
+
+    // Owner downgrades Alice editor -> viewer while her socket stays open.
+    permissions.setRole(roomId, 'editor-1', 'viewer');
+
+    // Collect server responses on Alice's socket and wait for the close/reason.
+    const denied: number[] = [];
+    let closeReason = '';
+    const rawWs = editor.provider.ws as unknown as {
+      addEventListener: (t: string, cb: (ev: unknown) => void) => void;
+    };
+    rawWs.addEventListener('message', (ev: unknown) => {
+      const data = (ev as { data?: ArrayBuffer | Buffer }).data;
+      if (!data) return;
+      const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data);
+      if (bytes[0] === 4) denied.push(4);
+    });
+    rawWs.addEventListener('close', (ev: unknown) => {
+      closeReason = String((ev as { reason?: string }).reason ?? '');
+    });
+
+    editor.doc.getText('content').insert(0, 'after downgrade\n');
+    await waitFor(() => denied.length, (v) => v > 0, 4000, 'denied frame after downgrade');
+
+    // The rejected edit never reaches the peer.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(peer.doc.getText('content').toString()).not.toContain('after downgrade');
+
+    // Downgrade to viewer keeps the connection open (read access remains)...
+    await new Promise((r) => setTimeout(r, 200));
+    expect(closeReason).toBe('');
+
+    // ...but fully revoking access closes the socket on the next edit.
+    permissions.setRole(roomId, 'editor-1', null);
+    editor.doc.getText('content').insert(0, 'after revoke\n');
+    await waitFor(
+      () => closeReason,
+      (v) => v.length > 0,
+      4000,
+      'socket closed after access revocation',
+    );
+
+    editor.provider.destroy();
+    peer.provider.destroy();
+  });
+
+  it('compacts S3 snapshots while a room stays continuously active', async () => {
+    const roomId = 'r-active-snapshot';
+    const a = connectClient('editor-1', 'Alice', '#f44336', roomId);
+    await waitFor(() => a.provider.synced, (v) => v === true, 5000, 'synced');
+
+    const room = rooms.get(roomId)!;
+    const snapsBefore = storage.objects.size;
+
+    // Simulate continuous collaboration across multiple snapshot intervals.
+    // Persistence is driven explicitly (the manager background timer is off
+    // in tests): each pass flushes, then compacts once the interval elapses.
+    for (let i = 0; i < 3; i++) {
+      a.doc
+        .getText('content')
+        .insert(a.doc.getText('content').length, `line ${i}\n`);
+      await waitFor(
+        () => room.getBufferedCount(),
+        (v) => v > 0,
+        4000,
+        'server receives update',
+      );
+      await room.flushUpdates();
+      await new Promise((r) => setTimeout(r, 320)); // > snapshotMs (300ms)
+      await room.maybeSnapshot();
+    }
+
+    expect(storage.objects.size).toBeGreaterThan(snapsBefore);
+    const activeSnapshots = [...storage.objects.keys()].filter((k) =>
+      k.includes(roomId),
+    );
+    expect(activeSnapshots.length).toBeGreaterThan(0);
+
+    // Snapshot bytes decode to the converged text.
+    const latestKey = activeSnapshots.at(-1)!;
+    const restored = new Y.Doc();
+    Y.applyUpdate(restored, storage.objects.get(latestKey)!);
+    const text = restored.getText('content').toString();
+    expect(text).toContain('line 0');
+    expect(text).toContain('line 2');
+
+    a.provider.destroy();
+  });
+
+  it('keeps a room in memory when eviction persistence fails, then flushes on retry', async () => {
+    // A dedicated room manager pointed at a storage backend that fails.
+    const failingPrisma = new FakePrisma();
+    let failFlush = true;
+    const origCreate = failingPrisma.documentUpdate.create.bind(
+      failingPrisma.documentUpdate,
+    );
+    failingPrisma.documentUpdate.create = async (args: {
+      data: { fileId: string; update: Buffer; sizeBytes: number };
+    }) => {
+      if (failFlush && args.data.fileId === 'r-fail-evict') {
+        throw new Error('simulated postgres outage');
+      }
+      return origCreate(args);
+    };
+    const failingRooms = new RoomManager(
+      failingPrisma as never,
+      storage as never,
+      new PresenceService(new FakeRedis() as never, {
+        get: (_k: string, d: number) => d,
+      } as never),
+      {
+        get: (key: string, d: number | boolean) =>
+          key === 'PERSIST_FLUSH_MS'
+            ? 20
+            : key === 'SNAPSHOT_INTERVAL_MS'
+              ? 10_000
+              : key === 'ROOM_TTL_MS'
+                ? 30
+                : key === 'COLLAB_AUTO_PERSIST'
+                  ? false
+                  : d,
+      } as never,
+    );
+    const room = await failingRooms.getOrCreate('r-fail-evict');
+    room.doc.getText('content').insert(0, 'must not be lost');
+    expect(room.getBufferedCount()).toBe(1);
+
+    // Wait past ROOM_TTL_MS (30ms) with no connections, then attempt eviction.
+    await new Promise((r) => setTimeout(r, 60));
+    await failingRooms.runIdleSweepForTest();
+    expect(failingRooms.get('r-fail-evict')).toBe(room);
+    expect(room.getBufferedCount()).toBe(1); // updates retained in memory
+
+    // Backend recovers: next successful eviction persists and removes the room.
+    failFlush = false;
+    failingRooms.resetRetryCooldownForTest('r-fail-evict');
+    await failingRooms.runIdleSweepForTest();
+    expect(failingRooms.get('r-fail-evict')).toBeUndefined();
+
+    // Reconstruct from storage: the edit that "failed" earlier is present.
+    const reloaded = new Room(
+      'r-fail-evict',
+      failingPrisma as never,
+      storage as never,
+      new PresenceService(new FakeRedis() as never, {
+        get: (_k: string, d: number) => d,
+      } as never),
+      20,
+      10_000,
+    );
+    await reloaded.ensureLoaded();
+    expect(reloaded.doc.getText('content').toString()).toBe('must not be lost');
+
+    await failingRooms.onModuleDestroy();
   });
 });

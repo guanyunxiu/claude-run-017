@@ -167,6 +167,7 @@ Backend (see `.env.example`):
 | `PERSIST_FLUSH_MS` | `5000` | max delay before buffered updates hit Postgres |
 | `SNAPSHOT_INTERVAL_MS` | `60000` | S3 compaction interval |
 | `ROOM_TTL_MS` | `60000` | idle room eviction delay |
+| `ROLE_CACHE_MS` | `3000` | how long a live socket's role is cached before re-checking the DB (downgrades take effect within this window) |
 | `PRESENCE_TTL_SECONDS` | `30` | Redis presence key TTL |
 
 The WebSocket endpoint authenticates with the same JWT, passed as a query
@@ -211,7 +212,14 @@ Flow for `ws://host/collab/:fileId?token=...`:
    event re-broadcasts the update to every *other* socket.
 4. **Awareness**: client awareness updates are applied server-side and fanned
    out, yielding cursors/selections/name/color to all peers.
-5. **Leave**: on `close` (or ping timeout) the client's awareness ids are
+5. **Live re-authorization**: the handshake role is only the *initial* value.
+   Before applying every mutation frame the gateway re-resolves the caller's
+   current role (a short per-document cache, `ROLE_CACHE_MS`, bounds DB load),
+   so an editor downgraded to viewer by an owner mid-session stops mutating on
+   the next keystroke without reconnecting; a user whose access is revoked
+   entirely is closed with code `1008`. If the permission store is briefly
+   unavailable the gateway fails closed (deny + reason frame).
+6. **Leave**: on `close` (or ping timeout) the client's awareness ids are
    removed — peers instantly see the cursor disappear — Redis presence is
    deleted, and after `ROOM_TTL_MS` idle the room flushes, snapshots and is
    evicted from memory.
@@ -240,10 +248,21 @@ S3/MinIO
   whole doc is compacted with `Y.encodeStateAsUpdate` into one S3 object, a
   `FileSnapshot` row records `lastUpdateId`, and the now-incorporated update
   rows + previous snapshot object are pruned. Only the newest snapshot is
-  retained.
+  retained. Snapshot scheduling is driven by a counter of *flushed bytes
+  pending compaction* (`bytesAwaitingSnapshot`), **not** by the in-memory
+  buffer — the tick empties that buffer first, so keying off it would starve
+  snapshots for rooms that stay continuously active.
 - Room load = apply newest S3 snapshot, then apply the tail of
   `DocumentUpdate` rows with `id > lastUpdateId`. Replay uses a private
   transaction origin so replayed updates are never persisted again.
+- **Eviction never discards edits.** A room is destroyed and removed from
+  memory only after its flush to Postgres succeeds (the minimum durable
+  step). If flush or snapshot fails (DB/S3 outage), the room — with its
+  `Y.Doc` and unflushed buffer intact — stays in memory and is retried after a
+  cooldown; reconnecting clients cannot therefore revert to an older version.
+  A failed S3 compaction alone does not block eviction: once updates are
+  committed to Postgres they remain reconstructable and the next room
+  instance compacts them.
 - `GET /api/files/:id/content` reconstructs plain text the same way (used by
   tests/E2E to assert autosave); live editing never uses this endpoint.
 

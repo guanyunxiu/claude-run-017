@@ -5,6 +5,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
+import { ConfigService } from '@nestjs/config';
 import { WebSocket, WebSocketServer } from 'ws';
 import type { Server as HttpServer, IncomingMessage } from 'http';
 import type { Duplex } from 'stream';
@@ -30,12 +31,20 @@ interface AuthedSocket extends WebSocket {
 }
 
 interface ConnectionMeta {
+  documentId: string;
   userId: string;
   name: string;
   color: string;
+  /** Role captured at upgrade time; kept fresh by resolveWriteRole(). */
   role: ProjectRole;
   /** Yjs awareness client ids this websocket opened in this room */
   docClientIds: Set<number>;
+}
+
+interface CachedRole {
+  at: number;
+  /** null means the user lost access to the document entirely */
+  role: ProjectRole | null;
 }
 
 /** Parse the client ids out of an encoded y-protocols awareness update. */
@@ -67,12 +76,24 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(CollaborationGateway.name);
   private wss: WebSocketServer | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
+  /**
+   * How long a role resolution is cached for a (document, user) pair.
+   * Without re-checking, a live socket would keep the role it had at
+   * handshake time forever, so an owner downgrading an editor to viewer
+   * would not take effect until the client reconnected. The short cache
+   * bounds database load while making downgrades effective almost at once.
+   */
+  private readonly roleCacheMs: number;
+  private readonly roleCache = new Map<string, CachedRole>();
 
   constructor(
     private readonly jwt: JwtService,
     private readonly permissions: PermissionService,
     private readonly rooms: RoomManager,
-  ) {}
+    config: ConfigService,
+  ) {
+    this.roleCacheMs = config.get<number>('ROLE_CACHE_MS', 3000);
+  }
 
   onModuleInit(): void {
     // Nothing yet; attach() is called from main.ts with the HTTP server.
@@ -222,6 +243,7 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     }
 
     const conn: ConnectionMeta = {
+      documentId,
       userId: user.sub,
       name: user.name,
       color: user.color,
@@ -244,13 +266,13 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     });
 
     ws.on('message', (data: Buffer) => {
-      try {
-        this.handleMessage(room, ws, conn, new Uint8Array(data), role);
-      } catch (err) {
-        this.logger.warn(
-          `Bad message in room ${documentId}: ${(err as Error).message}`,
-        );
-      }
+      void this.handleMessage(room, ws, conn, new Uint8Array(data)).catch(
+        (err: Error) => {
+          this.logger.warn(
+            `Bad message in room ${documentId}: ${err.message}`,
+          );
+        },
+      );
     });
 
     ws.on('close', () => {
@@ -262,13 +284,37 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  private handleMessage(
+  /**
+   * Resolve the *current* role for a live connection, re-checking the
+   * database at most once per `roleCacheMs` per (document, user). Returns
+   * null when access was revoked. The handshake-time role only seeds the
+   * cache and must not be trusted to authorize writes later on.
+   */
+  private async resolveRole(
+    documentId: string,
+    userId: string,
+  ): Promise<ProjectRole | null> {
+    const key = `${documentId}:${userId}`;
+    const cached = this.roleCache.get(key);
+    if (cached && Date.now() - cached.at < this.roleCacheMs) {
+      return cached.role;
+    }
+    const access = await this.permissions.getFileRole(documentId, userId);
+    const next: CachedRole = { at: Date.now(), role: access?.role ?? null };
+    this.roleCache.set(key, next);
+    return next.role;
+  }
+
+  private invalidateRole(documentId: string, userId: string): void {
+    this.roleCache.delete(`${documentId}:${userId}`);
+  }
+
+  private async handleMessage(
     room: Room,
     ws: AuthedSocket,
     conn: ConnectionMeta,
     data: Uint8Array,
-    role: ProjectRole,
-  ): void {
+  ): Promise<void> {
     const { type, decoder } = readMessageType(data);
 
     if (type === MESSAGE_SYNC) {
@@ -284,12 +330,41 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
         syncType === SYNC_STEP_2 ||
         syncType === SYNC_UPDATE
       ) {
-        // Both step-2 responses and incremental updates carry a full Yjs
-        // update; apply both identically when received from a client.
         const update = decoding.readVarUint8Array(decoder);
+
+        // Authorize against the CURRENT role, not the role captured at
+        // handshake time: an editor downgraded to viewer mid-session must
+        // stop mutating the document without needing to reconnect.
+        let role: ProjectRole | null;
+        try {
+          role = await this.resolveRole(conn.documentId, conn.userId);
+        } catch (err) {
+          // Fail closed: if the permission store is unavailable, refuse
+          // the write rather than silently accepting it.
+          this.logger.error(
+            `Role check failed for ${conn.userId}: ${(err as Error).message}`,
+          );
+          ws.send(
+            buildPermissionDenied(
+              'Temporarily unable to verify permissions, try again shortly',
+            ),
+          );
+          return;
+        }
+
+        if (role === null) {
+          // Access revoked entirely (removed from project / project deleted).
+          this.invalidateRole(conn.documentId, conn.userId);
+          ws.close(1008, 'Access to this document was revoked');
+          return;
+        }
+        conn.role = role;
+
         if (role === 'viewer') {
           ws.send(
-            buildPermissionDenied('Viewers cannot edit this document'),
+            buildPermissionDenied(
+              'You now have viewer access and cannot edit this document',
+            ),
           );
           return;
         }
@@ -336,6 +411,7 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     conn: ConnectionMeta,
   ): void {
     room.connections.delete(ws);
+    this.invalidateRole(conn.documentId, conn.userId);
     const clientIds = Array.from(conn.docClientIds);
     if (clientIds.length > 0) {
       // Origin = the closing socket so it is not echoed back; awareness event
