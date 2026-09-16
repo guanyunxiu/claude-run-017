@@ -74,6 +74,7 @@ class FakePrisma {
 
   fileSnapshot = {
     findFirst: async () => null,
+    findMany: async () => [] as any[],
     create: async () => ({}),
   };
 }

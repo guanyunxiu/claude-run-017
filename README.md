@@ -298,6 +298,18 @@ S3/MinIO
   A failed S3 compaction alone does not block eviction: once updates are
   committed to Postgres they remain reconstructable and the next room
   instance compacts them.
+- **Snapshot object verification before pruning.** A compaction uploads the
+  object and then reads it back; only when the object is retrievable (and the
+  byte length matches) does it commit the `FileSnapshot` row and delete any
+  `DocumentUpdate` rows. If read-back fails the log is deliberately left in
+  place and the next compaction retries, so a lost/half-written object can
+  never leave the document with neither snapshot nor update tail.
+- **Recovery from a missing snapshot object.** When loading, the newest
+  *readable* snapshot is used (trying older versions in turn), and the update
+  tail is read relative to that snapshot's smaller `lastUpdateId`. If no
+  snapshot object can be read and the compacted rows are gone, loading fails
+  loudly (`404`/`SnapshotUnrecoverableException`) instead of silently serving
+  an empty document that a later autosave could persist and destroy history.
 - `GET /api/files/:id/content` reconstructs plain text the same way (used by
   tests/E2E to assert autosave); live editing never uses this endpoint.
 
@@ -457,26 +469,34 @@ restore concurrently:
 2. Warm a local room and flush any already-buffered ordinary edits.
 3. Broadcast `restore-prepare` on the document channel; every warm room
    (including the coordinator) opens a **barrier**: the periodic tick skips
-   flush/snapshot/eviction/lease churn for that room, and client edits that
-   arrive during the window are applied locally (keeping the y-websocket
-   handshake coherent) but are NOT persisted or fanned over the bus — the
-   reset supersedes them. This is the documented, explicitly-confirmed
-   destructive policy surfaced in the UI's confirm dialog; no edit is silently
-   dropped on the normal editing path.
+   flush/snapshot/eviction/lease churn and does NOT drain the publish queue;
+   client edits that arrive during the window are applied to the in-memory
+   doc only — they are not buffered, not persisted, and `applyClientUpdate`
+   returns `false` so they are never published across the bus. Ordinary
+   `doc-update` frames that reach a barrier room late are quarantined and
+   discarded on commit (replayed only on abort). The reset therefore cannot
+   be mutated or resurrected by a peer still typing.
 4. Wait a short settle window for in-flight doc/awareness frames to drain.
-5. Build ONE canonical reset update — delete the current `content` and insert
-   the target text — seeded from the coordinator's converged document, and
-   write it as a single `DocumentUpdate` row plus a brand-new snapshot
-   (exactly one writer, authorized by the restore lock), so the update log
-   never gains two competing reset rows.
-6. Broadcast `restore-commit` carrying that same reset update. Each room
-   applies it with a dedicated `RESTORE` origin (broadcast to its local
-   sockets but never re-published as an ordinary `doc-update`, so there is no
-   loop), discards its superseded buffers, and leaves the barrier. Online
-   clients — editors and read-only viewers alike — see the document switch
-   instantly, regardless of which backend they are attached to.
-7. Any failure after prepare broadcasts `restore-abort`, rooms resume normal
-   operation, and the lock is released (its TTL is a dead-man's switch).
+5. Each room resets **its own** document to the target snapshot: delete its
+   *own* full `content` (the real local length, so a divergent room with
+   in-flight state is cleaned correctly — not a delete built from the
+   coordinator's length) and insert the target text. The coordinator writes
+   the target as a single reset row + a fresh snapshot under the restore-lock
+   authority, then read-back verifies the snapshot object before pruning
+   (see durability below).
+6. `restore-commit` carries the **target snapshot bytes**, not a
+   coordinator-specific delete increment. Every room independently derives
+   the same content, applies it with a `RESTORE` origin (broadcast to local
+   sockets but never republished as an ordinary `doc-update`), discards its
+   superseded buffers, and leaves the barrier. It then bumps the document
+   **epoch** (an awareness field): browsers watch it and rebuild their
+   Y.Doc/provider, dropping any local CRDT updates they sent during the
+   barrier that the server quarantined (otherwise the client would re-push
+   them and resurrect deleted text). Online editors and read-only viewers
+   switch instantly regardless of which backend they are attached to.
+7. Any failure after prepare broadcasts `restore-abort` (rooms replay their
+   quarantined updates and resume) and the lock is released (its TTL is a
+   dead-man's switch).
 
 A new join during or after the barrier loads the fresh snapshot + reset row
 from durable storage normally. Restored content therefore converges for
@@ -523,7 +543,7 @@ WS     /collab/:fileId?token=...         owner/editor may write, viewer read-onl
 
 ## 7. Tests
 
-### 7.1 Backend (80 tests)
+### 7.1 Backend (86 tests)
 
 ```bash
 cd backend && npm test
@@ -597,7 +617,7 @@ JWT/sessions are isolated like two real browsers) and asserts:
 - [x] Reconnect with backoff, dead-peer ping/pong, save/connection indicators,
       permission and sync error toasts
 - [x] Backend unit + HTTP integration + real WebSocket integration tests pass
-      (80/80), including a two-instance cross-backend convergence suite,
+      (86/86), including a two-instance cross-backend convergence suite,
       cross-instance kick, and removed-member read/awareness rejection tests
 - [x] Playwright two-browser E2E provided and Docker-runnable
 - [x] `docker compose up --build` starts TWO backends, an internal load balancer,

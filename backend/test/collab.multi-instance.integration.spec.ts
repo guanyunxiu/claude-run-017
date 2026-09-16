@@ -686,4 +686,73 @@ describe('Multi-instance collaboration (Redis backplane semantics)', () => {
     ).rejects.toBeDefined();
     await backends[1].busForTest.releaseRestoreLock(fileId);
   });
+
+  it('BUG1: edits typed on another instance during a restore never cross the bus and cannot resurrect content', async () => {
+    const fileId = 'f-restore-race';
+    const v0 = await seedVersion(backends[0], fileId, 'clean baseline');
+
+    // Warm rooms on both instances with live clients.
+    const a = connect(backends[0], 'editor-1', 'Alice', fileId);
+    const b = connect(backends[1], 'editor-2', 'Bob', fileId);
+    await waitFor(
+      () => a.provider.synced && b.provider.synced,
+      (v) => v === true,
+      5000,
+      'both synced',
+    );
+
+    const roomA = backends[0].rooms.get(fileId)!;
+    const roomB = backends[1].rooms.get(fileId)!;
+
+    // Manually drive a barrier across both rooms like restore-prepare.
+    const rid = 'race-rid';
+    roomA.enterRestoreBarrier(rid);
+    roomB.enterRestoreBarrier(rid);
+
+    // Bob (on backend 1) keeps typing DURING the restore barrier.
+    const racingDoc = new Y.Doc();
+    racingDoc.getText('content').insert(0, 'STRAY TYPING');
+    const racingUpdate = Y.encodeStateAsUpdate(racingDoc);
+    racingDoc.destroy();
+    const accepted = await roomB.applyClientUpdate(racingUpdate, {} as never);
+    expect(accepted).toBe(false);
+
+    // The stray edit must not exist on the coordinator's room.
+    expect(roomA.doc.getText('content').toString()).not.toContain('STRAY TYPING');
+    // The originating room did not add the stray update to its buffer
+    // (applyClientUpdate returned false and the barrier skips buffering).
+    expect(roomB.bufferContainsTextForTest('STRAY TYPING')).toBe(false);
+
+    // Coordinator commits the reset to the baseline version.
+    const targetBytes = await storage.getSnapshot(
+      prisma.snapshots
+        .filter((s) => s.fileId === fileId)
+        .sort((x, y) => x.version - y.version)[0].s3Key,
+    );
+    // Each room resets its OWN document to the target snapshot (idempotent
+    // regardless of pre-barrier divergence such as the stray typing).
+    roomA.resetToTarget(targetBytes);
+    await roomA.persistRestore(targetBytes);
+    roomA.commitRestoreBarrier(rid);
+    roomB.applyRestoreCommit(targetBytes, rid);
+
+    // Both rooms converge to the baseline; the stray content never returns.
+    expect(roomA.doc.getText('content').toString()).toBe('clean baseline');
+    expect(roomB.doc.getText('content').toString()).toBe('clean baseline');
+
+    // Force any later flush on backend 1 (e.g. after leadership change) and
+    // confirm the stray edit cannot reach the database.
+    roomB.setLeader(true);
+    await roomB.flushUpdates();
+    const durable = new Y.Doc();
+    const newest = prisma.snapshots
+      .filter((s) => s.fileId === fileId)
+      .sort((x, y) => y.version - x.version)[0];
+    Y.applyUpdate(durable, await storage.getSnapshot(newest.s3Key));
+    expect(durable.getText('content').toString()).toBe('clean baseline');
+    durable.destroy();
+
+    a.provider.destroy();
+    b.provider.destroy();
+  });
 });

@@ -121,6 +121,15 @@ export class Room {
   private restoreBarrier: string | null = null;
   /** Resolved when the current barrier completes (commit or abort). */
   private restoreBarrierDone: (() => void) | null = null;
+  /** Timestamp kept stable in the server-awareness payload. */
+  private serverStartedAt = Date.now();
+  /**
+   * Ordinary bus updates that arrived while a barrier was open. They are
+   * deliberately NOT applied: any pre-reset edit is superseded by the reset
+   * (applying it could mutate the reset basis or resurrect content after
+   * commit). Discarded on commit; applied only on abort.
+   */
+  private quarantinedBusUpdates: Uint8Array[] = [];
 
   /**
    * True iff this instance currently owns the document's persistence lease.
@@ -212,9 +221,10 @@ export class Room {
 
     // Server-published awareness field (savedAt timestamps). y-websocket
     // clients ignore fields they do not know about.
+    this.serverStartedAt = Date.now();
     this.awareness.setLocalStateField('server', {
       documentId,
-      startedAt: Date.now(),
+      startedAt: this.serverStartedAt,
     });
 
     this.awareness.on(
@@ -279,28 +289,47 @@ export class Room {
   }
 
   private async loadFromStorage(): Promise<void> {
-    const snapshot = await this.prisma.fileSnapshot.findFirst({
+    // Fetch all snapshot pointers newest-first and pick the newest whose
+    // OBJECT is actually readable. A metadata row can exist while its S3
+    // object is missing/corrupt; blindly using its lastUpdateId would then
+    // filter the update tail (id > lastUpdateId) and produce an empty or
+    // truncated document, because the rows it compacted were pruned.
+    const snapshotRows = (await this.prisma.fileSnapshot.findMany({
       where: { fileId: this.documentId },
       orderBy: { version: 'desc' },
-    });
+    })) as Array<{
+      id: string;
+      version: number;
+      s3Key: string;
+      lastUpdateId: number;
+    }>;
 
-    if (snapshot) {
+    let base: (typeof snapshotRows)[number] | null = null;
+    for (const row of snapshotRows) {
       try {
-        const bytes = await this.storage.getSnapshot(snapshot.s3Key);
+        const bytes = await this.storage.getSnapshot(row.s3Key);
         Y.applyUpdate(this.doc, bytes, ROOM_LOAD_ORIGIN);
         this.hasEverBeenPersisted = true;
+        base = row;
+        break;
       } catch (err) {
+        // Try the next-older snapshot. Rows compacted into an unreadable
+        // newer snapshot may still be reconstructable from an older one plus
+        // a wider update tail (the old lastUpdateId is smaller).
         this.logger.error(
-          `Failed to load snapshot ${snapshot.s3Key}: ${(err as Error).message}. Falling back to update log.`,
+          `Snapshot v${row.version} object unreadable (${(err as Error).message}); trying an older snapshot.`,
         );
       }
     }
 
+    // Tail boundary: everything after the chosen base snapshot. If the
+    // newest snapshot is unreadable, fall back to the update rows newer than
+    // the readable base (or all rows if none is readable).
     const tail = await this.prisma.documentUpdate.findMany({
-      where: snapshot
+      where: base
         ? {
             fileId: this.documentId,
-            id: { gt: BigInt(snapshot.lastUpdateId) },
+            id: { gt: BigInt(base.lastUpdateId) },
           }
         : { fileId: this.documentId },
       orderBy: { id: 'asc' },
@@ -314,13 +343,28 @@ export class Room {
         );
       }
     });
+
+    if (snapshotRows.length > 0 && base === null && tail.length === 0) {
+      // Every retained snapshot object is lost AND the update log was
+      // already pruned: there is no way to reconstruct this document. Do
+      // not silently serve an empty file - fail loudly so the caller does
+      // not overwrite the (possibly externally recoverable) history and the
+      // user sees a real error instead of missing content.
+      throw new SnapshotUnrecoverableException(this.documentId);
+    }
+
     this.hasEverBeenPersisted = this.hasEverBeenPersisted || tail.length > 0;
     this.persistedUpToId =
       tail.length > 0
         ? tail[tail.length - 1].id
-        : snapshot
-          ? BigInt(snapshot.lastUpdateId)
+        : base
+          ? BigInt(base.lastUpdateId)
           : null;
+    if (snapshotRows[0] && base && snapshotRows[0].id !== base.id) {
+      this.logger.warn(
+        `Recovered ${this.documentId} from older snapshot v${base.version} (newest v${snapshotRows[0].version} unreadable)`,
+      );
+    }
     this.logger.log(
       `Loaded doc with ${tail.length} tail updates, lastId=${this.persistedUpToId?.toString() ?? 'none'}`,
     );
@@ -329,17 +373,29 @@ export class Room {
   // ------------------------------------------------ ingress from websocket
   /**
    * Apply an update from a locally connected client and durably hand it to
-   * peer backends. The update is already in the persistence buffer by the
-   * time this runs (the doc 'update' listener put it there), so a failed
-   * publish never loses it: it stays in `pendingPublishes` and is retried in
-   * order on every tick until acknowledged by Redis.
+   * peer backends.
+   *
+   * Returns true when the update was accepted, false when it arrived while a
+   * restore barrier is open. During a barrier client edits must NOT cross the
+   * bus (they would resurrect content the reset deletes on other instances)
+   * and must NOT enter the persistence buffer (they could be flushed after
+   * the reset). The caller treats false as "rejected - do not propagate"; the
+   * update is still applied to this in-memory doc so the websocket stays
+   * consistent, and the incoming restore-commit resets it authoritatively.
    */
-  async applyClientUpdate(update: Uint8Array, origin: WebSocket): Promise<void> {
+  async applyClientUpdate(update: Uint8Array, origin: WebSocket): Promise<boolean> {
     Y.applyUpdate(this.doc, update, origin);
+    if (this.restoreBarrier !== null) {
+      // Quarantined: never publish across the bus. Discard any retry queue
+      // entries pushed by concurrent callers for the same barrier window.
+      this.pendingPublishes = [];
+      return false;
+    }
     if (this.bus.enabled) {
       this.pendingPublishes.push(update);
       await this.drainPendingPublishes();
     }
+    return true;
   }
 
   /** Retry any bus publishes that failed previously (in order). */
@@ -388,8 +444,17 @@ export class Room {
 
   // ----------------------------------------------------- ingress from bus
   applyBusUpdate(update: Uint8Array): void {
+    // While a restore barrier is open, ordinary bus updates are quarantined:
+    // they must not touch this room's document, otherwise a delayed in-flight
+    // edit that arrives around the prepare/commit window could mutate the
+    // state the reset is built from (or resurrect deleted content right after
+    // commit). The restore-commit frame is applied separately with the
+    // RESTORE origin and is always accepted.
+    if (this.restoreBarrier !== null) {
+      this.quarantinedBusUpdates.push(update);
+      return;
+    }
     // Origin = bus marker: broadcast to local sockets, never re-publish.
-    // The 'update' listener buffers it as a 'bus' entry while we are leader.
     Y.applyUpdate(this.doc, update, BUS_ORIGIN);
   }
 
@@ -420,6 +485,10 @@ export class Room {
       this.resolveBarrier();
     }
     this.restoreBarrier = rid;
+    // Drop any updates waiting to be (re)published so they cannot escape to
+    // other instances during the barrier and resurrect deleted content. The
+    // reset about to arrive is authoritative.
+    this.pendingPublishes = [];
     return new Promise<void>((resolve) => {
       this.restoreBarrierDone = resolve;
     });
@@ -430,21 +499,45 @@ export class Room {
   }
 
   /**
-   * Apply the authoritative reset update (commit) and leave the barrier.
-   * All ordinary buffers (pre-reset edits) are discarded: the reset is the
-   * new truth and retaining those entries could resurrect deleted content if
-   * a follower later leads. Coordinator separately persists it (followers
-   * never write).
+   * Apply the authoritative restore commit and leave the barrier.
+   *
+   * Rather than applying a delete-increment built on the coordinator's
+   * document (whose content length can differ from this room's when
+   * in-flight edits arrived just before the barrier), each room resets
+   * ITS OWN document to the target snapshot: delete its own full content
+   * then insert the target text. That makes the reset idempotent regardless
+   * of pre-barrier divergence. All ordinary buffers are discarded; the
+   * coordinator separately persists its own reset (followers never write).
    */
-  applyRestoreCommit(resetUpdate: Uint8Array, rid: string): void {
+  applyRestoreCommit(targetSnapshot: Uint8Array, rid: string): void {
     if (this.restoreBarrier !== null && this.restoreBarrier !== rid) return;
-    this.applyRestoreUpdate(resetUpdate);
+    this.resetToTarget(targetSnapshot);
     this.commitRestoreBarrier(rid);
   }
 
   /** Apply a reset update while the barrier stays open (coordinator flow). */
   applyRestoreUpdate(resetUpdate: Uint8Array): void {
     Y.applyUpdate(this.doc, resetUpdate, RESTORE_ORIGIN);
+  }
+
+  /**
+   * Reset THIS room's document to exactly the content in the target
+   * snapshot. Delete uses the local document's real length, so a peer that
+   * held divergent in-flight state still converges rather than leaving a
+   * prefix/suffix behind. Emits with RESTORE_ORIGIN (broadcast locally,
+   * never re-published as a normal doc-update or buffered).
+   */
+  resetToTarget(targetSnapshot: Uint8Array): void {
+    const target = new Y.Doc();
+    Y.applyUpdate(target, targetSnapshot, ROOM_LOAD_ORIGIN);
+    const targetText = target.getText('content').toString();
+    target.destroy();
+    this.doc.transact(() => {
+      const text = this.doc.getText('content');
+      const len = text.length;
+      if (len > 0) text.delete(0, len);
+      if (targetText.length > 0) text.insert(0, targetText);
+    }, RESTORE_ORIGIN);
   }
 
   /**
@@ -456,6 +549,9 @@ export class Room {
     this.buffer = [];
     this.bufferBytes = 0;
     this.pendingPublishes = [];
+    // The reset is authoritative: in-flight updates quarantined during the
+    // barrier are permanently discarded.
+    this.quarantinedBusUpdates = [];
     this.restoreBarrier = null;
     this.resolveBarrier();
   }
@@ -463,54 +559,21 @@ export class Room {
   /** Abandon a restore and resume normal operation. */
   abortRestoreBarrier(rid: string): void {
     if (this.restoreBarrier !== rid) return;
+    // No reset happened: replay the quarantined updates so legitimate edits
+    // that crossed the bus during the aborted barrier are not lost.
+    const queued = this.quarantinedBusUpdates;
+    this.quarantinedBusUpdates = [];
     this.restoreBarrier = null;
     this.resolveBarrier();
+    for (const update of queued) {
+      Y.applyUpdate(this.doc, update, BUS_ORIGIN);
+    }
   }
 
   private resolveBarrier(): void {
     const done = this.restoreBarrierDone;
     this.restoreBarrierDone = null;
     done?.();
-  }
-
-  /**
-   * Build a self-contained reset update that rewrites the document to exactly
-   * match `targetSnapshot`. It runs delete-all + insert-target on a throwaway
-   * doc seeded from THIS room's current converged state, so the update removes
-   * precisely the live content. Peer rooms hold the same pre-restore state
-   * (prepare barrier + in-flight drain), making the reset converge. This does
-   * NOT mutate the live document; coordinator and peers both apply it through
-   * applyRestoreCommit().
-   */
-  buildResetUpdate(targetSnapshot: Uint8Array): Uint8Array {
-    const scratch = new Y.Doc();
-    Y.applyUpdate(
-      scratch,
-      Y.encodeStateAsUpdate(this.doc),
-      ROOM_LOAD_ORIGIN,
-    );
-    const target = new Y.Doc();
-    Y.applyUpdate(target, targetSnapshot, ROOM_LOAD_ORIGIN);
-    const targetText = target.getText('content').toString();
-
-    scratch.transact(() => {
-      const text = scratch.getText('content');
-      const len = text.length;
-      if (len > 0) text.delete(0, len);
-      if (targetText.length > 0) text.insert(0, targetText);
-    }, RESTORE_ORIGIN);
-    const reset = Y.encodeStateAsUpdate(scratch);
-    scratch.destroy();
-    target.destroy();
-    return reset;
-  }
-
-  /**
-   * Apply the built reset update on the live document with the restore origin
-   * (broadcast to local sockets + buffered for persistence when leader).
-   */
-  applyResetUpdateLocally(resetUpdate: Uint8Array): void {
-    Y.applyUpdate(this.doc, resetUpdate, RESTORE_ORIGIN);
   }
 
   /**
@@ -541,8 +604,37 @@ export class Room {
   }
 
   /**
+   * Bump the document epoch after a restore. The local server-awareness
+   * state change is fanned out to local sockets (awareness 'update'
+   * listener) and, by the manager, mirrored to other instances. Browsers
+   * watch this field and rebuild their provider/doc when it changes,
+   * discarding any local CRDT updates they sent during the restore window
+   * that the server quarantined (otherwise those unacknowledged items would
+   * be re-pushed and resurrect deleted content).
+   */
+  bumpRestoreEpoch(epoch: string): void {
+    const current =
+      (this.awareness.getLocalState()?.server as
+        | { epoch?: string }
+        | undefined)?.epoch ?? null;
+    if (current === epoch) return;
+    this.awareness.setLocalStateField('server', {
+      documentId: this.documentId,
+      startedAt: this.serverStartedAt,
+      epoch,
+    });
+  }
+
+  /**
    * Write the current document (or an explicit state) as a new snapshot and
    * apply history retention. Shared by periodic compaction and restore.
+   *
+   * The update log is pruned ONLY AFTER the new snapshot object has been
+   * written AND read back successfully and the metadata row committed. If
+   * the object cannot be verified, no DocumentUpdate rows or old snapshots
+   * are deleted: keeping redundant update rows is harmless (reconstruction
+   * still works) while pruning an unverifiable snapshot would make the file
+   * unrecoverable.
    */
   async writeSnapshot(explicitState?: Uint8Array): Promise<number> {
     const state = explicitState ?? Y.encodeStateAsUpdate(this.doc);
@@ -553,6 +645,28 @@ export class Room {
     const version = previous ? previous.version + 1 : 0;
     const key = this.storage.snapshotKey(this.documentId, version);
     await this.storage.putSnapshot(key, state);
+
+    // Read-after-write verification: confirm the object is actually
+    // retrievable before pointing metadata at it and pruning the log.
+    let verified: Uint8Array;
+    try {
+      verified = await this.storage.getSnapshot(key);
+    } catch (err) {
+      // Best-effort cleanup of the unverifiable object, but DO NOT create a
+      // snapshot row and DO NOT prune anything. The update log remains the
+      // source of truth; the next compaction retries.
+      this.logger.error(
+        `Snapshot v${version} object failed read-back verification (${(err as Error).message}); keeping update log unpruned`,
+      );
+      throw new SnapshotObjectUnverifiedException(this.documentId, version);
+    }
+    // Cheap content sanity check: decoded length should match what we wrote.
+    if (!verified || verified.byteLength !== state.byteLength) {
+      this.logger.error(
+        `Snapshot v${version} read-back size mismatch; keeping update log unpruned`,
+      );
+      throw new SnapshotObjectUnverifiedException(this.documentId, version);
+    }
 
     const upToId = this.persistedUpToId ? Number(this.persistedUpToId) : 0;
     await this.prisma.fileSnapshot.create({
@@ -856,6 +970,22 @@ export class Room {
   }
 
   /**
+   * Test helper: true if the persistence buffer contains an update whose
+   * decoded document includes `needle` text. Used to assert quarantined
+   * during-restore edits are never buffered.
+   */
+  bufferContainsTextForTest(needle: string): boolean {
+    for (const entry of this.buffer) {
+      const probe = new Y.Doc();
+      Y.applyUpdate(probe, entry.update, ROOM_LOAD_ORIGIN);
+      const has = probe.getText('content').toString().includes(needle);
+      probe.destroy();
+      if (has) return true;
+    }
+    return false;
+  }
+
+  /**
    * Called by the manager the moment this instance wins leadership. Retained
    * for the takeover flush; the buffer already holds the converged state, so
    * an immediate shouldFlush is scheduled via setLeader(). This enqueues the
@@ -957,6 +1087,33 @@ export class RestoreInProgressException extends ConflictException {
 export class SnapshotVersionNotFoundException extends NotFoundException {
   constructor(fileId: string, version: number) {
     super(`Snapshot v${version} of ${fileId} not found`);
+  }
+}
+
+/**
+ * Thrown when no snapshot object can be read and the update rows that
+ * compacted into them have already been pruned - the document simply cannot
+ * be reconstructed. We refuse to serve an empty document (which a later
+ * autosave could persist, destroying history).
+ */
+export class SnapshotUnrecoverableException extends NotFoundException {
+  constructor(fileId: string) {
+    super(
+      `Document ${fileId} cannot be recovered: all snapshot objects are unreadable and the update log was compacted`,
+    );
+  }
+}
+
+/**
+ * Thrown when a freshly written snapshot object cannot be read back
+ * successfully. The caller must not prune the update log in that case.
+ */
+export class SnapshotObjectUnverifiedException extends Error {
+  constructor(fileId: string, version: number) {
+    super(
+      `Snapshot v${version} of ${fileId} failed read-back verification; update log retained`,
+    );
+    this.name = 'SnapshotObjectUnverifiedException';
   }
 }
 
@@ -1142,7 +1299,7 @@ export class RoomManager implements OnModuleInit, OnModuleDestroy {
     fileId: string,
     version: number,
     settleMs = 200,
-  ): Promise<{ version: number }> {
+  ): Promise<{ version: number; epoch: string }> {
     // 1. exclusive restore lock
     const locked = await this.bus.acquireRestoreLock(
       fileId,
@@ -1173,7 +1330,8 @@ export class RoomManager implements OnModuleInit, OnModuleDestroy {
         await room.flushUpdates();
       }
 
-      // 4. barrier everywhere (including this coordinator room)
+      // 4. barrier everywhere (including this coordinator room). rid also
+      //    serves as the restore epoch clients watch for.
       rid = `restore-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       room.enterRestoreBarrier(rid);
       if (this.bus.enabled) {
@@ -1183,27 +1341,32 @@ export class RoomManager implements OnModuleInit, OnModuleDestroy {
 
       // 5. Let in-flight doc/awareness frames propagate and the current
       //    leader finish flushing. The exclusive restore lock + barrier
-      //    (tick skips barrier rooms) then make us the sole writer for the
-      //    reset, regardless of the normal persistence-lease owner.
+      //    (tick skips barrier rooms) then make us the sole writer,
+      //    regardless of the normal persistence-lease owner.
       await new Promise((r) => setTimeout(r, settleMs));
 
-      // 6. build reset from this room's current converged state
-      const resetUpdate = room.buildResetUpdate(targetBytes);
+      // 6. Reset THIS room to the target (delete its own full content then
+      //    insert the target), so the operation is safe even if this room
+      //    held pre-barrier divergence the target snapshot did not include.
+      room.resetToTarget(targetBytes);
 
-      // 7. Apply the reset locally first (RESTORE origin broadcasts it to
-      //    local sockets), then durably persist the row + snapshot exactly
-      //    once. Authorization comes from the restore lock, not isLeader.
-      //    writeSnapshot() must observe the already-reset document.
-      room.applyRestoreUpdate(resetUpdate);
-      await room.persistRestore(resetUpdate);
+      // 7. Durably persist the reset state exactly once, authorized by the
+      //    restore lock (not isLeader). We write the target snapshot bytes
+      //    as both the DocumentUpdate reset row and the new snapshot; every
+      //    room independently derives the same content from the same target.
+      await room.persistRestore(targetBytes);
       room.commitRestoreBarrier(rid);
+      // Bump the epoch so connected clients discard unacknowledged local
+      // CRDT updates sent during the barrier and resync to the new state.
+      room.bumpRestoreEpoch(rid);
 
-      // 8. tell every other instance to apply the same reset
+      // 8. tell every other instance to reset their own rooms to the same
+      //    target snapshot (idempotent per-room reset), and bump epochs.
       if (this.bus.enabled) {
-        await this.bus.publishRestoreCommit(fileId, rid, resetUpdate);
+        await this.bus.publishRestoreCommit(fileId, rid, targetBytes);
       }
       const newVersion = await this.latestSnapshotVersion(fileId);
-      return { version: newVersion };
+      return { version: newVersion, epoch: rid };
     } catch (err) {
       if (preparePublished && rid) {
         try {
@@ -1255,6 +1418,9 @@ export class RoomManager implements OnModuleInit, OnModuleDestroy {
         return;
       }
       room.applyRestoreCommit(resetUpdate, rid);
+      // Same epoch as the coordinator: connected clients discard local
+      // unacknowledged edits and resync to the reset state.
+      room.bumpRestoreEpoch(rid);
     } catch (err) {
       this.logger.error(
         `restore commit failed for ${fileId}: ${(err as Error).message}`,
@@ -1280,15 +1446,11 @@ export class RoomManager implements OnModuleInit, OnModuleDestroy {
     for (const [id, room] of this.rooms) {
       // A restore is coordinating this document: skip ordinary flush,
       // snapshot, eviction and lease churn (the restore path is the single
-      // writer while its barrier is open).
+      // writer while its barrier is open). Crucially we must NOT drain the
+      // publish retry queue here: anything pushed during the barrier is a
+      // quarantined in-flight edit whose bus delivery would resurrect the
+      // pre-restore content on other instances.
       if (room.inRestoreBarrier) {
-        if (this.bus.enabled) {
-          try {
-            await room.drainPendingPublishes();
-          } catch {
-            /* retried next tick */
-          }
-        }
         continue;
       }
       // ---------------- leadership lease ----------------

@@ -156,7 +156,10 @@ export class FilesService {
   }
 
   /**
-   * Reconstruct a Y.Doc from the last snapshot + tail of the update log.
+   * Reconstruct a Y.Doc from the newest READABLE snapshot + the update tail.
+   * If the newest snapshot object is missing/corrupt, fall back to older
+   * snapshots (each is self-contained) with a correspondingly wider update
+   * tail, instead of returning an empty/truncated document or failing.
    */
   async loadDocument(fileId: string): Promise<Y.Doc> {
     const file = await this.prisma.file.findUnique({
@@ -165,26 +168,46 @@ export class FilesService {
     });
     if (!file) throw new NotFoundException('File not found');
 
-    const snapshot = await this.prisma.fileSnapshot.findFirst({
+    const snapshotRows = (await this.prisma.fileSnapshot.findMany({
       where: { fileId },
       orderBy: { version: 'desc' },
-    });
+    })) as Array<{
+      id: string;
+      version: number;
+      s3Key: string;
+      lastUpdateId: number;
+    }>;
 
     const doc = new Y.Doc();
-
-    if (snapshot) {
-      const bytes = await this.storage.getSnapshot(snapshot.s3Key);
-      Y.applyUpdate(doc, bytes);
+    let base: (typeof snapshotRows)[number] | null = null;
+    for (const row of snapshotRows) {
+      try {
+        const bytes = await this.storage.getSnapshot(row.s3Key);
+        Y.applyUpdate(doc, bytes);
+        base = row;
+        break;
+      } catch {
+        // Try the next-older snapshot; the wider tail below fills the gap.
+      }
     }
 
     const rows = await this.prisma.documentUpdate.findMany({
-      where: snapshot
-        ? { fileId, id: { gt: BigInt(snapshot.lastUpdateId) } }
+      where: base
+        ? { fileId, id: { gt: BigInt(base.lastUpdateId) } }
         : { fileId },
       orderBy: { id: 'asc' },
     });
     for (const row of rows) {
       Y.applyUpdate(doc, row.update as unknown as Uint8Array);
+    }
+
+    // Every snapshot object is unreadable AND the update log was already
+    // compacted: the document genuinely cannot be reconstructed. Do not
+    // return an empty file (a later autosave could overwrite history).
+    if (snapshotRows.length > 0 && base === null && rows.length === 0) {
+      throw new NotFoundException(
+        `File ${fileId} cannot be recovered: snapshot objects are unreadable and the update log was compacted`,
+      );
     }
     return doc;
   }

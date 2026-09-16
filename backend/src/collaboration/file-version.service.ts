@@ -69,7 +69,15 @@ export class FileVersionService {
     }
     if (!file) throw new NotFoundException('File not found');
 
-    const bytes = await this.storage.getSnapshot(snapshot.s3Key);
+    let bytes: Uint8Array;
+    try {
+      bytes = await this.storage.getSnapshot(snapshot.s3Key);
+    } catch {
+      // The metadata row exists but its object storage payload is gone.
+      throw new NotFoundException(
+        `Version ${version} snapshot object is unavailable`,
+      );
+    }
     const doc = new Y.Doc();
     Y.applyUpdate(doc, bytes, this.previewOrigin());
     const content = doc.getText('content').toString();

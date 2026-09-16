@@ -16,7 +16,7 @@ interface Options {
 }
 
 interface ServerAwarenessState {
-  server?: { savedAt?: number; documentId?: string };
+  server?: { savedAt?: number; documentId?: string; epoch?: string };
   user?: { id: string; name: string; color: string };
 }
 
@@ -45,6 +45,14 @@ export function useYFile({
    */
   const [serverReadonly, setServerReadonly] = useState(false);
   const [accessRevoked, setAccessRevoked] = useState(false);
+  /**
+   * Restore epoch of the current provider. The server bumps
+   * `awareness.server.epoch` after a version rollback; watching it lets us
+   * fully rebuild the Y.Doc + provider so locally buffered CRDT updates
+   * that the server quarantined during the restore cannot be re-pushed and
+   * resurrect content the reset deleted.
+   */
+  const [restoreEpoch, setRestoreEpoch] = useState<string | null>(null);
 
   // Stable refs for callbacks to avoid recreating the provider.
   const callbacksRef = useRef({ onPermissionDenied });
@@ -180,12 +188,16 @@ export function useYFile({
       ) as Array<[number, ServerAwarenessState]>;
       const users = new Map<string, PresenceUser>();
       let newestSavedAt: number | null = null;
+      let epoch: string | null = null;
       for (const [clientId, state] of states) {
         if (state.server?.savedAt) {
           newestSavedAt =
             newestSavedAt === null
               ? state.server.savedAt
               : Math.max(newestSavedAt, state.server.savedAt);
+        }
+        if (state.server?.epoch) {
+          epoch = state.server.epoch;
         }
         if (state.user) {
           users.set(`${clientId}:${state.user.id}`, {
@@ -200,6 +212,20 @@ export function useYFile({
       if (newestSavedAt !== null) {
         setLastSavedAt(newestSavedAt);
         setSaveStatus('saved');
+      }
+      // A new restore epoch means the authoritative document was reset.
+      // Trigger a full provider/doc rebuild (effect dependency) so any
+      // local CRDT update the server quarantined during the restore is
+      // discarded rather than re-sent and resurrecting deleted content.
+      if (epoch) {
+        setRestoreEpoch((prev) => {
+          if (prev !== null && prev !== epoch) {
+            // Defer the reconnect toast slightly; the provider teardown
+            // below handles the actual document replacement.
+            setConnection('connecting');
+          }
+          return epoch;
+        });
       }
     };
     provider.awareness.on('change', updatePresentUsers);
@@ -233,7 +259,13 @@ export function useYFile({
       setYdoc(null);
       setProvider(null);
     };
-  }, [fileId, currentUser.id, currentUser.name, currentUser.color]);
+  }, [
+    fileId,
+    currentUser.id,
+    currentUser.name,
+    currentUser.color,
+    restoreEpoch,
+  ]);
 
   const forceReconnect = useCallback(() => {
     providerRef.current?.connect();
