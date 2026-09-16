@@ -21,8 +21,9 @@ test pyramid up to a two-browser Playwright E2E scenario.
 | Permissions | `owner` > `editor` > `viewer`, enforced on REST **and** the WebSocket; UI disables forbidden actions |
 | Editor | Monaco with TS/JS/JSON/CSS/HTML/Python/Go/… workers, syntax highlighting, read-only for viewers |
 | Sync | Byte-compatible **y-websocket protocol** (sync step 1/2/update + awareness) on raw `ws` |
-| CRDT | One server-side `Y.Doc` per file = source of truth; arbitrary concurrent edits merge |
-| Cursors | Yjs **Awareness** (`y-monaco`) carries cursor/selection, user name + color |
+| CRDT | One server-side `Y.Doc` per file per instance; replicas converge over the bus; arbitrary concurrent edits merge |
+| Scaling | Optional Redis backplane (`COLLAB_BUS=redis`): cross-instance CRDT + awareness fan-out, one lease-elected persistence leader per file |
+| Cursors | Yjs **Awareness** (`y-monaco`) carries cursor/selection, user name + color, across instances |
 | Presence | Online users derived from awareness, mirrored into **Redis** with TTL |
 | Autosave | Merged Yjs updates appended to Postgres every `PERSIST_FLUSH_MS`; full snapshots compacted into S3 every `SNAPSHOT_INTERVAL_MS` |
 | Reliability | y-websocket auto-reconnect with backoff, ws ping/pong dead-peer detection, room TTL eviction, flush-on-shutdown |
@@ -34,7 +35,7 @@ test pyramid up to a two-browser Playwright E2E scenario.
 
 ```
 .
-├── docker-compose.yml          # postgres + redis + minio + backend + frontend (+ e2e profile)
+├── docker-compose.yml          # postgres + redis + minio + 2 backends + LB + frontend (+ e2e profile)
 ├── .env.example                # backend environment reference
 ├── backend/
 │   ├── prisma/
@@ -48,12 +49,17 @@ test pyramid up to a two-browser Playwright E2E scenario.
 │   │   ├── files/               # file CRUD, language inference, content reconstruction
 │   │   ├── collaboration/
 │   │   │   ├── collaboration.gateway.ts   # raw ws, y-websocket protocol, authz
-│   │   │   ├── room-manager.ts            # Room (Y.Doc + awareness), autosave, snapshots
+│   │   │   ├── room-manager.ts            # Room (Y.Doc + awareness), leader, autosave
 │   │   │   ├── presence.service.ts        # Redis presence hash + TTL
-│   │   │   └── collab.protocol.ts         # lib0/y-protocols frame builders
+│   │   │   ├── collab.protocol.ts         # lib0/y-protocols frame builders
+│   │   │   └── bus/                       # collaboration backplane
+│   │   │       ├── collaboration-bus.ts            # abstract bus + framing/lease API
+│   │   │       ├── local-collaboration-bus.ts      # no-op single-instance bus
+│   │   │       ├── redis-collaboration-bus.ts      # pub/sub + Lua lease election
+│   │   │       └── in-memory-collaboration-bus.ts  # test double w/ Redis semantics
 │   │   ├── storage/             # S3/MinIO client
 │   │   └── common/              # Prisma + Redis providers
-│   └── test/                    # HTTP integration + WebSocket integration tests
+│   └── test/                    # HTTP, WS and multi-instance integration tests
 ├── frontend/
 │   ├── src/
 │   │   ├── api/                 # REST client + WS URL helpers
@@ -84,17 +90,24 @@ Wait for healthchecks, then open:
 
 | Service | URL | Credentials |
 | --- | --- | --- |
-| Frontend | http://localhost:8080 | register your own, or seed users below |
-| Backend API | http://localhost:8080/api/health | — |
+| Frontend (via LB) | http://localhost:8080 | register your own, or seed users below |
+| API/WS load balancer | http://localhost:8081 (`/api/health`, `/collab/<fileId>`) | — |
+| Backend instance 1 (direct) | http://localhost:3001 | — |
+| Backend instance 2 (direct) | http://localhost:3002 | — |
 | MinIO console | http://localhost:9001 | `minioadmin` / `minioadmin` |
 
-The backend container runs `prisma migrate deploy` on boot and the
+Both backends share one Postgres/Redis/MinIO and converge over the Redis
+collaboration bus (`COLLAB_BUS=redis`). To verify scaling manually, point one
+browser at `:3001` and another at `:3002`; the frontend normally uses the
+load-balanced origin on :8080.
+
+Every backend container runs `prisma migrate deploy` on boot and the
 `minio-init` sidecar creates the `collab-snapshots` bucket.
 
-Load demo data (run once):
+Load demo data (run once, against either instance):
 
 ```bash
-docker compose exec backend npm run seed
+docker compose exec backend-1 npm run seed
 # alice@example.com / password123  (owner)
 # bob@example.com   / password123  (editor)
 # carol@example.com / password123  (viewer)
@@ -168,6 +181,8 @@ Backend (see `.env.example`):
 | `SNAPSHOT_INTERVAL_MS` | `60000` | S3 compaction interval |
 | `ROOM_TTL_MS` | `60000` | idle room eviction delay |
 | `ROLE_CACHE_MS` | `3000` | how long a live socket's role is cached before re-checking the DB (downgrades take effect within this window) |
+| `COLLAB_BUS` | `local` | `local` = single instance (exact phase-1 behaviour), `redis` = cross-instance pub/sub + leader election |
+| `BUS_LEASE_MS` | `10000` | persistence-leader lease TTL; renewed each tick, expired leaders fail over within this window |
 | `PRESENCE_TTL_SECONDS` | `30` | Redis presence key TTL |
 
 The WebSocket endpoint authenticates with the same JWT, passed as a query
@@ -306,6 +321,76 @@ presence:doc:<fileId>
 - y-websocket handles reconnect with exponential backoff automatically; the
   toolbar also exposes a manual reconnect button.
 
+### 5.5 Horizontal scaling across multiple backends
+
+Phase 1 kept a `Y.Doc` only in the process that owned a room. With more than
+one backend replica a socket on instance A could not see updates typed on
+instance B. Phase 2 adds an optional **collaboration backplane** behind the
+`CollaborationBus` abstraction (`src/collaboration/bus/`), selected by
+`COLLAB_BUS`:
+
+| Mode | Behaviour |
+| --- | --- |
+| `local` (default) | In-process no-op bus. Identical to phase 1; zero overhead. |
+| `redis` | Redis pub/sub cross-instance fan-out + Redis lease leader election. |
+
+**Document channel.** Every instance subscribes to `collab:doc:<fileId>` when
+a room is created (ref-counted; one SUBSCRIBE per file). Frames carry a 1-byte
+kind, an instance-id header and the binary payload:
+
+- `doc-update` — a Yjs update produced by a locally connected client.
+- `awareness` — encoded awareness (cursor/selection/user state).
+- `sync-step1` / `sync-step2` — targeted bootstrapping (see below).
+
+Each update has two transaction origins the room distinguishes: a **local
+socket** and the **bus marker**. The rules guarantee no loops and exactly one
+persistence writer:
+
+1. A client on instance A sends an update → A applies it with the socket as
+   origin, broadcasts to its other local sockets, and publishes it to Redis.
+2. Instances B/C receive the frame, skip their own instance id, and apply it
+   with the `BUS` origin. That fans the update out to their local sockets but
+   they never publish it back to Redis (no ping-pong loop).
+3. **Single persistence writer.** Each document has one elected leader, keyed
+   `collab:lock:doc:<fileId>` (a Redis key with `PX` TTL set/renewed through a
+   compare-value Lua script). The leader buffers every converged update —
+   including bus-relayed ones — and flushes merged updates to Postgres and
+   compacts S3 snapshots exactly as in single-instance mode. Followers never
+   write, so the update log is never doubled. Leader + followers still hold
+   the *same converged document*, because every update crosses the bus.
+
+**Leader election / failover.** A room campaigns for the lease once it has a
+local socket (idle empty rooms do not). The leader renews on every tick well
+inside `BUS_LEASE_MS` (default 10s); a crashed leader stops renewing, the key
+expires, and a follower acquires it. On takeover the new leader enqueues one
+full-state checkpoint (`Y.encodeStateAsUpdate`) for an immediate flush. That
+covers the edge where the dead leader had relayed an update to peers but died
+within its flush window: the converged state already lives in the new leader's
+memory (it received the same bus frames) and is persisted in one row. It then
+serves normal deltas thereafter. Snapshot/evict logic, including
+"flush-failure keeps the room in memory and retries", is unchanged.
+
+**Bootstrap join.** A room loads the durable state (S3 snapshot + Postgres
+tail) on creation, then publishes a bus `sync-step1` carrying an empty state
+vector a few times (0/100/350/800 ms) to defeat the race where two instances
+create rooms for the same new file simultaneously. Any peer with a warm room
+answers with a unicast `sync-step2` (targeted via the header's instance id);
+the reply is applied with the bus origin. The browser's own y-websocket
+handshake is untouched.
+
+**Presence ownership.** The existing `presence:doc:<fileId>` Redis hash is
+unchanged, but an instance now writes/removes only fields whose awareness
+clientIds belong to sockets it owns (`clientId -> socket` map). A bus-received
+awareness change on instance B never overwrites or deletes a heartbeat written
+by instance A, and disconnects delete only that instance's owned ids.
+
+**Topology.** `docker compose up` starts `backend-1` and `backend-2` sharing
+one Postgres/Redis/MinIO, an internal nginx `gateway` that load-balances both
+`/api/` and the `/collab/` WebSocket upgrade (ip_hash for stickiness, though
+correctness does not rely on it), and the frontend nginx pointing at that
+gateway. You can reach a single instance directly on host ports 3001/3002 to
+force a browser onto a chosen backend.
+
 ---
 
 ## 6. API reference
@@ -344,7 +429,7 @@ WS     /collab/:fileId?token=...         owner/editor may write, viewer read-onl
 
 ## 7. Tests
 
-### 7.1 Backend (43 tests)
+### 7.1 Backend (57 tests)
 
 ```bash
 cd backend && npm test
@@ -363,7 +448,19 @@ cd backend && npm test
   HTTP server upgraded by the gateway with **two stock `y-websocket` clients**
   (`disableBc` so traffic really crosses the server) — handshake rejection,
   bidirectional merge, awareness propagation, viewer read-only enforcement,
-  disconnect awareness cleanup, Postgres + S3 persistence.
+  disconnect awareness cleanup, Postgres + S3 persistence, live role
+  downgrade on an already-open socket, and flush-failure room retention.
+- **Bus framing unit** (`bus/collaboration-bus.spec.ts`): binary frame
+  round-trip for every message kind, unicode headers, malformed-frame rejection.
+- **Multi-instance integration** (`test/collab.multi-instance.integration.spec.ts`):
+  TWO fully wired gateways on separate ports sharing one persistence world and
+  one `InMemoryCollaborationBus` (which faithfully emulates Redis pub/sub
+  publisher-exclusion + TTL leases). Stock y-websocket clients connect to
+  *different backends* and assert cross-instance text CRDT convergence,
+  cross-instance awareness visibility, viewer denial on a follower instance,
+  exactly one elected leader (no doubled `DocumentUpdate` rows), identical
+  reconstructed content via the REST endpoint, and leader failover after the
+  current leader loses its lease.
 
 ### 7.2 Two-browser E2E (Playwright)
 
@@ -394,14 +491,20 @@ JWT/sessions are isolated like two real browsers) and asserts:
 - [x] Reconnect with backoff, dead-peer ping/pong, save/connection indicators,
       permission and sync error toasts
 - [x] Backend unit + HTTP integration + real WebSocket integration tests pass
-      (43/43)
+      (57/57), including a two-instance cross-backend convergence suite
 - [x] Playwright two-browser E2E provided and Docker-runnable
-- [x] `docker compose up --build` starts the entire stack with migrations and
-      bucket creation automated
+- [x] `docker compose up --build` starts TWO backends, an internal load balancer,
+      Postgres/Redis/MinIO and the frontend, with migrations and bucket
+      creation automated
+- [x] Horizontal scaling: same-file edits converge across backend instances via
+      Redis pub/sub; awareness/cursors cross instances; one lease-elected
+      leader per file persists (no duplicated/lost update rows); leader
+      failover reconstructs from S3 snapshot + Postgres tail; `COLLAB_BUS=local`
+      preserves exact phase-1 single-instance behaviour
 
-### Phase 2 ideas (out of scope here)
+### Possible follow-ups (out of scope here)
 
 Directory CRUD/move, comments & suggestions, conflict-free file rename
-awareness, per-room horizontal scaling with a Redis/Yjs pub/sub backplane,
-full-deletion snapshots retention/version history UI, JWT refresh tokens,
-operational metrics.
+awareness, full-deletion snapshot retention / version history UI, JWT refresh
+tokens, operational metrics, Redis-cluster/streams as an alternative to
+pub/sub for very large rooms.

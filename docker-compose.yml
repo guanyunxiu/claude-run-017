@@ -1,3 +1,33 @@
+# Reusable environment block for every backend instance.
+x-backend-environment: &backend-environment
+  NODE_ENV: production
+  PORT: "8080"
+  # Browser origins that talk to the API/WebSocket through the load balancer.
+  CORS_ORIGIN: "http://localhost:8080,http://localhost:5173,http://localhost:8081"
+  JWT_SECRET: "dev-only-jwt-secret-change-me"
+  JWT_EXPIRES_IN: "12h"
+  DATABASE_URL: "postgresql://collab:collab@postgres:5432/collab?schema=public"
+  REDIS_URL: "redis://redis:6379"
+  # Enable the cross-instance collaboration backplane + leader election.
+  COLLAB_BUS: "redis"
+  BUS_LEASE_MS: "10000"
+  S3_ENDPOINT: "http://minio:9000"
+  S3_REGION: "us-east-1"
+  S3_BUCKET: "collab-snapshots"
+  S3_ACCESS_KEY_ID: "minioadmin"
+  S3_SECRET_ACCESS_KEY: "minioadmin"
+  S3_FORCE_PATH_STYLE: "true"
+  PERSIST_FLUSH_MS: "5000"
+  SNAPSHOT_INTERVAL_MS: "60000"
+  ROOM_TTL_MS: "60000"
+  PRESENCE_TTL_SECONDS: "30"
+
+x-backend-healthcheck: &backend-healthcheck
+  test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 10s
+  timeout: 5s
+  retries: 10
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -61,28 +91,12 @@ services:
       "
     restart: "no"
 
-  backend:
+  # Backend instance #1.
+  backend-1:
     build:
       context: ./backend
     restart: unless-stopped
-    environment:
-      NODE_ENV: production
-      PORT: "8080"
-      CORS_ORIGIN: "http://localhost:8080,http://localhost:5173"
-      JWT_SECRET: "dev-only-jwt-secret-change-me"
-      JWT_EXPIRES_IN: "12h"
-      DATABASE_URL: "postgresql://collab:collab@postgres:5432/collab?schema=public"
-      REDIS_URL: "redis://redis:6379"
-      S3_ENDPOINT: "http://minio:9000"
-      S3_REGION: "us-east-1"
-      S3_BUCKET: "collab-snapshots"
-      S3_ACCESS_KEY_ID: "minioadmin"
-      S3_SECRET_ACCESS_KEY: "minioadmin"
-      S3_FORCE_PATH_STYLE: "true"
-      PERSIST_FLUSH_MS: "5000"
-      SNAPSHOT_INTERVAL_MS: "60000"
-      ROOM_TTL_MS: "60000"
-      PRESENCE_TTL_SECONDS: "30"
+    environment: *backend-environment
     depends_on:
       postgres:
         condition: service_healthy
@@ -91,24 +105,61 @@ services:
       minio-init:
         condition: service_completed_successfully
     ports:
-      - "8080:8080"
+      - "3001:8080"
+    healthcheck: *backend-healthcheck
+
+  # Backend instance #2. Same Postgres/Redis/MinIO; document traffic for the
+  # same fileId converges over Redis pub/sub with a single elected writer.
+  backend-2:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    environment: *backend-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports:
+      - "3002:8080"
+    healthcheck: *backend-healthcheck
+
+  # Load balancer in front of BOTH backends: REST API and the y-websocket
+  # upgrade share an upstream (ip_hash keeps a browser on one instance when
+  # possible, but the bus works regardless of where a socket lands).
+  gateway:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./deploy/nginx/backend-lb.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      backend-1:
+        condition: service_healthy
+      backend-2:
+        condition: service_healthy
+    ports:
+      - "8081:80"
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost/api/health"]
       interval: 10s
       timeout: 5s
       retries: 10
 
+  # Static frontend; its own nginx proxies /api and /collab to BOTH backends
+  # through the gateway so every browser request is load balanced.
   frontend:
     build:
       context: ./frontend
     restart: unless-stopped
     depends_on:
-      backend:
+      gateway:
         condition: service_healthy
     ports:
       - "8080:80"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:80/"]
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost/"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -124,7 +175,9 @@ services:
     depends_on:
       frontend:
         condition: service_healthy
-      backend:
+      backend-1:
+        condition: service_healthy
+      backend-2:
         condition: service_healthy
     restart: "no"
 

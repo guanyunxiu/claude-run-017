@@ -5,6 +5,7 @@ import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { CollaborationGateway } from '../src/collaboration/collaboration.gateway';
 import { Room, RoomManager } from '../src/collaboration/room-manager';
+import { LocalCollaborationBus } from '../src/collaboration/bus/local-collaboration-bus';
 import { PresenceService } from '../src/collaboration/presence.service';
 import { PermissionService } from '../src/projects/permission.service';
 
@@ -182,6 +183,7 @@ describe('Collaboration WebSocket gateway (integration)', () => {
                   ? false
                   : d,
       } as never,
+      new LocalCollaborationBus(),
     );
     gateway = new CollaborationGateway(
       jwt,
@@ -572,6 +574,7 @@ describe('Collaboration WebSocket gateway (integration)', () => {
                   ? false
                   : d,
       } as never,
+      new LocalCollaborationBus(),
     );
     const room = await failingRooms.getOrCreate('r-fail-evict');
     room.doc.getText('content').insert(0, 'must not be lost');
@@ -599,6 +602,7 @@ describe('Collaboration WebSocket gateway (integration)', () => {
       } as never),
       20,
       10_000,
+      new LocalCollaborationBus(),
     );
     await reloaded.ensureLoaded();
     expect(reloaded.doc.getText('content').toString()).toBe('must not be lost');

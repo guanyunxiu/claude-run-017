@@ -1,5 +1,8 @@
 import * as Y from 'yjs';
 import { Room } from './room-manager';
+import { LocalCollaborationBus } from './bus/local-collaboration-bus';
+
+const newBus = () => new LocalCollaborationBus();
 
 type UpdateRow = {
   id: bigint;
@@ -113,6 +116,7 @@ function makeRoom(flushMs = 50, snapshotMs = 1_000_000) {
     presence as never,
     flushMs,
     snapshotMs,
+    newBus(),
   );
   return { room, prisma, storage, presence };
 }
@@ -139,6 +143,7 @@ describe('Room persistence', () => {
       new FakePresence() as never,
       50,
       1_000_000,
+      newBus(),
     );
     await room2.ensureLoaded();
     expect(room2.doc.getText('content').toString()).toBe('hello world');
@@ -164,6 +169,7 @@ describe('Room persistence', () => {
       new FakePresence() as never,
       50,
       1_000_000,
+      newBus(),
     );
     await room2.ensureLoaded();
     expect(room2.doc.getText('content').toString()).toBe('snapshot me');
@@ -228,6 +234,7 @@ describe('Room persistence', () => {
       new FakePresence() as never,
       50,
       1_000_000,
+      newBus(),
     );
     await room.ensureLoaded();
     room.doc.getText('content').insert(0, 'precious edits');

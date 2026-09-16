@@ -10,7 +10,6 @@ import { WebSocket, WebSocketServer } from 'ws';
 import type { Server as HttpServer, IncomingMessage } from 'http';
 import type { Duplex } from 'stream';
 import * as decoding from 'lib0/decoding';
-import * as awarenessProtocol from 'y-protocols/awareness';
 import { PermissionService } from '../projects/permission.service';
 import { ProjectRole } from '../projects/roles';
 import { Room, RoomManager } from './room-manager';
@@ -386,12 +385,9 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     if (type === MESSAGE_AWARENESS) {
       // y-websocket frame: [MESSAGE_AWARENESS][length-prefixed awareness update]
       const payload = decoding.readVarUint8Array(decoder);
-      awarenessProtocol.applyAwarenessUpdate(
-        room.awareness,
-        payload,
-        ws,
-      );
       const addedClientIds = readChangedClientIds(payload);
+      // Apply + mirror to peers via the bus + refresh owned presence.
+      room.applyClientAwareness(payload, ws);
       for (const id of addedClientIds) {
         const state = room.awareness.getStates().get(id);
         // Only track clients that actually carry user state (y-monaco peers).
@@ -411,17 +407,16 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     conn: ConnectionMeta,
   ): void {
     room.connections.delete(ws);
-    this.invalidateRole(conn.documentId, conn.userId);
     const clientIds = Array.from(conn.docClientIds);
     if (clientIds.length > 0) {
-      // Origin = the closing socket so it is not echoed back; awareness event
-      // broadcasts removals to remaining participants and refreshes presence.
-      awarenessProtocol.removeAwarenessStates(room.awareness, clientIds, ws);
-      void room.recordDisconnectInPresence(clientIds);
+      // Removes local awareness (broadcast + bus mirror inside the room) and
+      // deletes only this instance's owned Redis presence entries.
+      room.removeLocalClients(clientIds, ws);
       for (const id of clientIds) {
         room.clientIdToSocket.delete(id);
       }
     }
+    this.invalidateRole(conn.documentId, conn.userId);
     room.touch();
     this.logger.log(
       `Client ${conn.userId} left room ${room.documentId} (${room.connections.size} remaining)`,

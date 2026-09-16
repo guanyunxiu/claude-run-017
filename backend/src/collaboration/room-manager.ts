@@ -1,7 +1,9 @@
 import {
+  Inject,
   Injectable,
   Logger,
   OnModuleDestroy,
+  OnModuleInit,
 } from '@nestjs/common';
 import * as Y from 'yjs';
 import { Awareness } from 'y-protocols/awareness';
@@ -15,6 +17,8 @@ import {
   buildSyncStep1Response,
   buildSyncUpdateMessage,
 } from './collab.protocol';
+import { CollaborationBus } from './bus/collaboration-bus';
+import { COLLAB_BUS } from './bus/collaboration-bus.provider';
 
 export type ProjectRole = 'owner' | 'editor' | 'viewer';
 
@@ -32,17 +36,21 @@ interface BufferEntry {
   size: number;
 }
 
-/** Marker origin applied to updates replayed from storage so they are not persisted again. */
+/** Updates replayed from storage on room load: neither broadcast nor persisted. */
 const ROOM_LOAD_ORIGIN = Symbol('room-load-origin');
+/** Updates received from another backend instance through the bus. */
+const BUS_ORIGIN = Symbol('bus-origin');
+
+/** A websocket transaction origin (our internal origins are symbols). */
+function isLocalSocketOrigin(origin: unknown): origin is WebSocket {
+  return typeof origin === 'object' && origin !== null;
+}
 
 /**
- * One Room = one Y.Doc shared by every websocket connected to a documentId.
- *
- * The Room owns:
- *   - the in-memory Y.Doc (CRDT source of truth while the room is active)
- *   - a server-side Awareness instance (cursors / selections / presence)
- *   - persistence buffers periodically flushed to Postgres and compacted
- *     into S3 snapshots.
+ * One Room = one Y.Doc shared by every websocket connected to a documentId on
+ * THIS instance. When the Redis bus is enabled, updates/awareness are mirrored
+ * to peer instances and only the elected persistence leader writes to
+ * Postgres/S3 for a given document.
  */
 export class Room {
   private readonly logger: Logger;
@@ -64,14 +72,16 @@ export class Room {
   /** highest DocumentUpdate.id already incorporated into this in-memory doc */
   private persistedUpToId: bigint | null = null;
   private hasEverBeenPersisted = false;
-  /**
-   * Bytes of document updates persisted to Postgres since the last S3
-   * compaction. A snapshot is due once this is non-zero AND the interval
-   * elapsed. We must not key scheduling off `buffer.length`: the tick flushes
-   * (and empties) that buffer *before* checking the snapshot condition, which
-   * would otherwise starve snapshots for continuously active rooms.
-   */
+  /** Bytes of Postgres updates since the last S3 compaction (snapshot trigger). */
   private bytesAwaitingSnapshot = 0;
+
+  /**
+   * True iff this instance currently owns the document's persistence lease.
+   * With the in-process (single-instance) bus there is nobody to compete
+   * with, so a room leads from birth; under the Redis bus leadership is
+   * acquired via tick().
+   */
+  isLeader: boolean;
 
   constructor(
     public readonly documentId: string,
@@ -80,19 +90,35 @@ export class Room {
     private readonly presence: PresenceService,
     private readonly flushMs: number,
     private readonly snapshotMs: number,
+    private readonly bus: CollaborationBus,
   ) {
     this.logger = new Logger(`Room:${this.documentId.slice(0, 8)}`);
     this.awareness = new Awareness(this.doc);
+    this.isLeader = !bus.enabled;
+
     this.doc.on('update', (update: Uint8Array, origin: unknown) => {
-      // Broadcast to everyone except the originating socket. y-websocket
-      // clients treat all SYNC_UPDATE messages the same regardless of sub-type.
-      const message = buildSyncUpdateMessage(update);
-      for (const [socket] of this.connections) {
-        if (socket === origin || socket.readyState !== 1) continue;
-        socket.send(message);
+      const fromStorage = origin === ROOM_LOAD_ORIGIN;
+      const fromBus = origin === BUS_ORIGIN;
+      void fromBus;
+
+      // Broadcast to local peers except the originator (a websocket). Storage
+      // replay is never echoed; bus-relayed updates go to every local socket.
+      if (!fromStorage) {
+        const message = buildSyncUpdateMessage(update);
+        for (const [socket] of this.connections) {
+          if (socket === origin || socket.readyState !== 1) continue;
+          socket.send(message);
+        }
       }
-      // Never persist updates replayed from storage during room load.
-      if (origin !== ROOM_LOAD_ORIGIN) {
+
+      // Single-writer persistence: the leader is the ONLY instance that
+      // writes, and it persists every update that advanced its converged
+      // document - regardless of whether it originated on a local socket or
+      // arrived from another instance via the bus. Followers never write.
+      // Bus updates are therefore buffered on the leader (but still not
+      // re-published to the bus, so there is no loop and no duplicated rows:
+      // the originating follower is by definition a non-leader).
+      if (this.isLeader && !fromStorage) {
         this.buffer.push({ update, size: update.byteLength });
         this.bufferBytes += update.byteLength;
       }
@@ -110,17 +136,37 @@ export class Room {
       'update',
       (
         change: { added: number[]; updated: number[]; removed: number[] },
-        originSocket: unknown,
+        origin: unknown,
       ) => {
         const changedClients = change.added
           .concat(change.updated)
           .concat(change.removed);
         const message = buildAwarenessUpdate(this.awareness, changedClients);
+        const fromLocal = isLocalSocketOrigin(origin);
+
+        // Fan out to local sockets (skip originator for local changes).
         for (const [socket] of this.connections) {
-          if (socket === originSocket || socket.readyState !== 1) continue;
+          if (fromLocal && socket === origin) continue;
+          if (socket.readyState !== 1) continue;
           socket.send(message);
         }
-        void this.syncPresenceFromAwareness();
+
+        // Only mirror local awareness changes to peer backends; bus-received
+        // awareness must not be republished (would loop).
+        if (fromLocal && this.bus.enabled) {
+          // Encode just the awareness payload without the outer frame type.
+          void this.bus.publishAwareness(
+            this.documentId,
+            awarenessPayload(this.awareness, changedClients),
+          );
+        }
+
+        // Presence ownership: an instance writes/removes Redis presence ONLY
+        // for clientIds whose websocket it owns. Remote (bus) awareness and
+        // the server's own state are excluded.
+        if (fromLocal) {
+          void this.syncPresenceFromAwareness(changedClients);
+        }
       },
     );
   }
@@ -133,10 +179,11 @@ export class Room {
     return this.connections.size === 0 && Date.now() - this.lastActivity > ttlMs;
   }
 
-  /**
-   * Load current document state from S3 snapshot + Postgres update tail.
-   * Runs once, lazily, when the first connection joins.
-   */
+  hasLocalConnections(): boolean {
+    return this.connections.size > 0;
+  }
+
+  // ---------------------------------------------------------------- load
   async ensureLoaded(): Promise<void> {
     if (this.loaded) return;
     if (this.loadPromise) return this.loadPromise;
@@ -194,20 +241,60 @@ export class Room {
     );
   }
 
-  /** Apply a client-originating update; emits the doc 'update' event. */
+  // ------------------------------------------------ ingress from websocket
+  /** Apply an update sent by a locally connected client and mirror it to peers. */
   applyClientUpdate(update: Uint8Array, origin: WebSocket): void {
     Y.applyUpdate(this.doc, update, origin);
+    if (this.bus.enabled) {
+      void this.bus.publishDocUpdate(this.documentId, update);
+    }
   }
 
-  /** y-websocket SYNC_STEP_1 -> response containing missing structural state. */
-  encodeSyncStep1Response(clientStateVector: Uint8Array): Uint8Array {
-    return buildSyncStep1Response(this.doc, clientStateVector);
+  // ----------------------------------------------------- awareness ingress
+  /** Apply an awareness update from a locally connected client and mirror it. */
+  applyClientAwareness(payload: Uint8Array, origin: WebSocket): void {
+    // The awareness 'update' listener fans out locally, republishes to the
+    // bus (origin is a local socket) and refreshes owned presence entries.
+    applyEncodedAwareness(this.awareness, payload, origin);
   }
 
-  /**
-   * Persist buffered updates. Called on a timer and when the room is evicted.
-   */
+  /** Remove awareness state for locally owned clients (disconnect). */
+  removeLocalClients(clientIds: number[], origin: WebSocket): void {
+    // 'update' listener publishes the removal to peers; we then delete ONLY
+    // the Redis presence entries owned by this instance.
+    awarenessProtocol.removeAwarenessStates(
+      this.awareness,
+      clientIds,
+      origin,
+    );
+    void this.removeLocalPresence(clientIds);
+  }
+
+  // ----------------------------------------------------- ingress from bus
+  applyBusUpdate(update: Uint8Array): void {
+    // Origin = bus marker: broadcast to local sockets, never re-publish and
+    // (on the leader) never re-buffer because the originating leader persisted.
+    Y.applyUpdate(this.doc, update, BUS_ORIGIN);
+  }
+
+  applyBusAwareness(payload: Uint8Array): void {
+    applyEncodedAwareness(this.awareness, payload, BUS_ORIGIN);
+  }
+
+  /** A peer asks for this instance's current state (used at startup catch-up). */
+  answerSyncStep1(stateVector: Uint8Array, targetInstance: string): void {
+    if (!this.bus.enabled) return;
+    const update = Y.encodeStateAsUpdate(this.doc, stateVector);
+    void this.bus.publishSyncStep2(this.documentId, update, targetInstance);
+  }
+
+  applyBusSyncStep2(update: Uint8Array): void {
+    Y.applyUpdate(this.doc, update, BUS_ORIGIN);
+  }
+
+  // ------------------------------------------------------------- persistence
   async flushUpdates(): Promise<number> {
+    if (!this.isLeader) return 0;
     if (this.flushing || this.buffer.length === 0) return 0;
     this.flushing = true;
     const entries = this.buffer;
@@ -216,8 +303,6 @@ export class Room {
     this.bufferBytes = 0;
 
     try {
-      // Merge many small updates into one row to reduce write amplification,
-      // while preserving a total-order append log.
       const merged =
         entries.length === 1
           ? entries[0].update
@@ -251,22 +336,14 @@ export class Room {
     }
   }
 
-  /**
-   * Compact the active document into a fresh S3 snapshot and prune the update
-   * tail. We retain only the newest snapshot per file.
-   *
-   * Scheduling is based on `bytesAwaitingSnapshot` (Postgres updates accumulated
-   * since the previous snapshot), NOT on the in-memory buffer, because the
-   * periodic tick flushes that buffer first.
-   */
   async maybeSnapshot(force = false): Promise<boolean> {
+    if (!this.isLeader) return false;
     const due = force || Date.now() - this.lastSnapshot >= this.snapshotMs;
     if (!due) return false;
     if (this.buffer.length > 0) {
       await this.flushUpdates();
     }
     if (this.bytesAwaitingSnapshot === 0) {
-      // Nothing newer than the previous snapshot; retry later.
       this.lastSnapshot = Date.now();
       return false;
     }
@@ -278,8 +355,8 @@ export class Room {
     });
     const version = previous ? previous.version + 1 : 0;
     const key = this.storage.snapshotKey(this.documentId, version);
-    // Upload first: if this fails we throw before any metadata change and the
-    // next attempt retries cleanly with the update log still intact.
+    // Upload first: a failure throws before any metadata change and the next
+    // attempt retries cleanly with the update log still intact.
     await this.storage.putSnapshot(key, state);
 
     const upToId = this.persistedUpToId ? Number(this.persistedUpToId) : 0;
@@ -303,9 +380,8 @@ export class Room {
           },
         });
       } catch (err) {
-        // The new snapshot already covers these rows (load reads only
-        // id > lastUpdateId), so leaving them behind is harmless; they are
-        // pruned by the next snapshot. Do not fail/roll back the snapshot.
+        // The new snapshot already covers these rows; a pruning failure is
+        // harmless and the next snapshot cleans them up.
         this.logger.warn(
           `Snapshot taken but pruning the update tail failed: ${(err as Error).message}`,
         );
@@ -333,60 +409,92 @@ export class Room {
   }
 
   shouldFlush(now: number = Date.now()): boolean {
-    return this.buffer.length > 0 && now - this.lastFlush >= this.flushMs;
+    return (
+      this.isLeader &&
+      this.buffer.length > 0 &&
+      now - this.lastFlush >= this.flushMs
+    );
   }
 
   shouldSnapshot(now: number = Date.now()): boolean {
-    // Due once the interval has elapsed AND there are persisted updates not
-    // yet captured by a snapshot. Continuously active rooms must compact too.
     return (
+      this.isLeader &&
       this.bytesAwaitingSnapshot > 0 &&
       now - this.lastSnapshot >= this.snapshotMs
     );
   }
 
   /**
-   * Durability barrier used before a room is destroyed/evicted.
-   *
-   * MUST leave no buffered updates only in memory. Postgres flush success is
-   * the hard requirement: once committed there, reconnecting clients can
-   * reconstruct the document from the update log even if the S3 compaction
-   * below fails. The snapshot itself is best-effort here - a failure is
-   * logged but does not block eviction (and leaves the committed update rows
-   * to be compacted by the next room instance).
+   * Durability barrier before a leader room is destroyed. Postgres flush is
+   * the hard requirement; S3 compaction failure must not block eviction since
+   * committed update rows remain reconstructable for the next instance.
    */
   async persistAllForEviction(): Promise<void> {
-    // Loop because flushUpdates is not re-entrant-safe across concurrent
-    // calls and new edits can theoretically land right before the last flush.
-    await this.flushUpdates();
-    if (this.bytesAwaitingSnapshot > 0) {
-      try {
-        await this.maybeSnapshot(true);
-      } catch (err) {
-        // The committed update rows in Postgres are still the source of truth
-        // until a snapshot supersedes them; the next room instance compacts.
-        this.logger.warn(
-          `Snapshot during eviction failed (updates are safe in Postgres): ${(err as Error).message}`,
-        );
-      }
-    }
-    // Final guard: if the snapshot attempt did not throw but also could not
-    // compact (should not happen with force), make sure nothing remains only
-    // in the in-memory buffer.
-    if (this.buffer.length > 0) {
+    if (this.isLeader) {
       await this.flushUpdates();
+      if (this.bytesAwaitingSnapshot > 0) {
+        try {
+          await this.maybeSnapshot(true);
+        } catch (err) {
+          this.logger.warn(
+            `Snapshot during eviction failed (updates are safe in Postgres): ${(err as Error).message}`,
+          );
+        }
+      }
+      if (this.buffer.length > 0) {
+        await this.flushUpdates();
+      }
     }
   }
 
+  // ------------------------------------------------------------- leadership
+  setLeader(leader: boolean): void {
+    if (leader && !this.isLeader) {
+      this.logger.log('Became persistence leader for this document');
+    } else if (!leader && this.isLeader) {
+      this.logger.warn('Lost persistence leadership; dropping local buffer');
+      // Another instance owns the lease now. Discard any unflushed buffer so
+      // we cannot double-write; the new leader holds the converged state via
+      // the bus (and persisted rows survive regardless).
+      this.buffer = [];
+      this.bufferBytes = 0;
+    }
+    this.isLeader = leader;
+  }
+
+  /** Any unflushed local edits (only meaningful on the leader). */
+  hasBufferedUpdates(): boolean {
+    return this.buffer.length > 0;
+  }
+
   /**
-   * Reflect awareness state into Redis presence. We strip the (potentially
-   * large) cursor payload down to a compact JSON entry per client.
+   * Called by the manager the moment this instance wins leadership. The room
+   * already holds the converged document state (storage load + every update
+   * relayed over the bus while it was a follower), but bus-origin updates were
+   * deliberately NOT buffered (only the then-leader persisted them). If that
+   * previous leader crashed before flushing, its unflushed delta exists only in
+   * peer memory. We therefore enqueue the FULL current state for one immediate
+   * flush. It is pushed straight into the persistence buffer - never applied
+   * to the doc - so it is not broadcast to already-converged clients; Yjs CRDT
+   * idempotency makes the redundant content harmless on replay.
    */
-  private async syncPresenceFromAwareness(): Promise<void> {
+  ingestLeadershipCheckpoint(): void {
+    const full = Y.encodeStateAsUpdate(this.doc);
+    this.buffer.push({ update: full, size: full.byteLength });
+    this.bufferBytes += full.byteLength;
+    this.lastFlush = 0; // make shouldFlush() due on the next tick
+  }
+
+  // --------------------------------------------------------------- presence
+  private async syncPresenceFromAwareness(clientIds: number[]): Promise<void> {
     const states = this.awareness.getStates();
     const pending: Array<Promise<void>> = [];
-    for (const [clientId, state] of states) {
-      const user = state?.user as
+    for (const clientId of clientIds) {
+      // Only touch presence for clients owned by a local socket.
+      if (!this.clientIdToSocket.has(clientId)) continue;
+      const state = states.get(clientId);
+      if (!state) continue;
+      const user = state.user as
         | { id: string; name: string; color: string }
         | undefined;
       if (!user) continue;
@@ -403,15 +511,13 @@ export class Room {
     await Promise.all(pending);
   }
 
-  async recordDisconnectInPresence(clientIds: number[]): Promise<void> {
+  async removeLocalPresence(clientIds: number[]): Promise<void> {
     await Promise.all(
       clientIds.map((id) => this.presence.remove(this.documentId, id)),
     );
   }
 
   async broadcastSavedAt(): Promise<void> {
-    // The server awareness field lets every client update its "saved" indicator
-    // without a separate protocol / polling endpoint.
     this.awareness.setLocalStateField('server', {
       documentId: this.documentId,
       savedAt: Date.now(),
@@ -422,45 +528,100 @@ export class Room {
   getBufferedCount(): number {
     return this.buffer.length;
   }
+
+  /** Encode this room's current awareness for a set of clients (no outer frame). */
+  encodeAwareness(clientIds: number[]): Uint8Array {
+    return awarenessPayload(this.awareness, clientIds);
+  }
+
+  encodeSyncStep1Response(clientStateVector: Uint8Array): Uint8Array {
+    return buildSyncStep1Response(this.doc, clientStateVector);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Awareness encoding helpers. Kept module-private so the gateway and room use
+// identical, frame-compatible payloads with y-protocols.
+// ---------------------------------------------------------------------------
+import * as encoding from 'lib0/encoding';
+import * as awarenessProtocol from 'y-protocols/awareness';
+
+function awarenessPayload(aw: Awareness, clientIds: number[]): Uint8Array {
+  return awarenessProtocol.encodeAwarenessUpdate(aw, clientIds);
+}
+
+function applyEncodedAwareness(
+  aw: Awareness,
+  payload: Uint8Array,
+  origin: unknown,
+): void {
+  awarenessProtocol.applyAwarenessUpdate(aw, payload, origin);
 }
 
 @Injectable()
-export class RoomManager implements OnModuleDestroy {
+export class RoomManager implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RoomManager.name);
   private readonly rooms = new Map<string, Room>();
   private readonly flushMs: number;
   private readonly snapshotMs: number;
   private readonly ttlMs: number;
+  private readonly leaseMs: number;
   private readonly timer: NodeJS.Timeout | null;
-  /**
-   * Rooms whose eviction failed (Postgres/S3 unavailable). They stay in the
-   * map with their Y.Doc and unflushed buffer intact and are retried after a
-   * cooldown instead of being dropped (which would silently revert the doc).
-   */
-  private readonly evictionRetryAt = new Map<string, number>();
-  private static readonly EVICTION_RETRY_DELAY_MS = 5_000;
+  private readonly bus: CollaborationBus;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly storage: StorageService,
     private readonly presence: PresenceService,
     config: ConfigService,
+    @Inject(COLLAB_BUS) bus: CollaborationBus,
   ) {
     this.flushMs = config.get<number>('PERSIST_FLUSH_MS', 5000);
     this.snapshotMs = config.get<number>('SNAPSHOT_INTERVAL_MS', 60000);
     this.ttlMs = config.get<number>('ROOM_TTL_MS', 60000);
-    // Production runs the background persistence loop. Tests disable it
-    // (COLLAB_AUTO_PERSIST=false) so timers cannot race the assertions and
-    // evict rooms mid-scenario.
-    if (config.get<boolean>('COLLAB_AUTO_PERSIST', true)) {
+    // Renew well within the TTL so a leader hiccup shorter than the interval
+    // does not hand the lease away.
+    this.leaseMs = config.get<number>(
+      'BUS_LEASE_MS',
+      Math.max(this.flushMs * 2, 10_000),
+    );
+    this.bus = bus;
+    this.bus.attachHandlers({
+      onDocUpdate: (fileId, update) => {
+        this.rooms.get(fileId)?.applyBusUpdate(update);
+      },
+      onAwareness: (fileId, payload) => {
+        this.rooms.get(fileId)?.applyBusAwareness(payload);
+      },
+      onSyncStep1: (fileId, stateVector, fromInstance) => {
+        this.rooms.get(fileId)?.answerSyncStep1(stateVector, fromInstance);
+      },
+      onSyncStep2: (fileId, update) => {
+        this.rooms.get(fileId)?.applyBusSyncStep2(update);
+      },
+    });
+
+    const autoPersist = config.get<boolean>('COLLAB_AUTO_PERSIST', true);
+    if (autoPersist) {
       this.timer = setInterval(() => {
         void this.tick();
       }, Math.min(this.flushMs, 1000));
-      // Do not keep the process alive solely for the interval.
       this.timer.unref?.();
     } else {
       this.timer = null;
     }
+  }
+
+  async onModuleInit(): Promise<void> {
+    await this.bus.start();
+  }
+
+  get instanceId(): string {
+    return this.bus.instanceId;
+  }
+
+  async start(): Promise<void> {
+    await this.bus.start();
   }
 
   async getOrCreate(documentId: string): Promise<Room> {
@@ -473,11 +634,39 @@ export class RoomManager implements OnModuleDestroy {
         this.presence,
         this.flushMs,
         this.snapshotMs,
+        this.bus,
       );
       this.rooms.set(documentId, room);
-      await room.ensureLoaded();
+      if (this.bus.enabled) {
+        await this.bus.subscribe(documentId);
+        // Load durable state synchronously (needed before serving reads);
+        // peer catch-up runs in the background because both sides of a new
+        // document can race to create their rooms at the same instant.
+        await room.ensureLoaded();
+        void this.catchUpFromPeers(documentId);
+      } else {
+        await room.ensureLoaded();
+      }
     }
     return room;
+  }
+
+  /**
+   * Ask peer instances for their current state. A brand-new follower can join
+   * a document before the leader's room exists, in which case the very first
+   * sync-step1 has nobody to answer. Retry a few times with a short delay so
+   * the handshake completes regardless of startup ordering, and also cover
+   * late-joining peers. A state vector of "empty" requests the full state;
+   * peers answer with a targeted sync-step2 over the bus.
+   */
+  private async catchUpFromPeers(documentId: string): Promise<void> {
+    if (!this.bus.enabled) return;
+    const emptyVector = Y.encodeStateVector(new Y.Doc());
+    const delays = [0, 100, 350, 800];
+    for (const delay of delays) {
+      await new Promise((r) => setTimeout(r, delay));
+      await this.bus.publishSyncStep1(documentId, emptyVector);
+    }
   }
 
   get(documentId: string): Room | undefined {
@@ -488,22 +677,52 @@ export class RoomManager implements OnModuleDestroy {
     return this.rooms.size;
   }
 
-  /** Test hook: run exactly one persistence + eviction pass. */
+  /** Test hook: run exactly one persistence + leadership + eviction pass. */
   async runIdleSweepForTest(): Promise<void> {
     await this.tick();
   }
-
-  /** Test hook: clear eviction retry cooldowns. */
   resetRetryCooldownForTest(id?: string): void {
     if (id) this.evictionRetryAt.delete(id);
     else this.evictionRetryAt.clear();
   }
 
+  private readonly evictionRetryAt = new Map<string, number>();
+  private static readonly EVICTION_RETRY_DELAY_MS = 5_000;
+
   private async tick(): Promise<void> {
     const now = Date.now();
     for (const [id, room] of this.rooms) {
+      // ---------------- leadership lease ----------------
+      // With the in-process bus there is only one instance, so every room is
+      // leader from birth and no lease negotiation runs (phase-1 behaviour).
       try {
-        // Durability runs for every room, busy or idle.
+        if (this.bus.enabled) {
+          if (room.isLeader) {
+            const renewed = await this.bus.renewLease(id, this.leaseMs);
+            if (!renewed) room.setLeader(false);
+          }
+          if (!room.isLeader) {
+            // Only campaign for documents that matter locally. Idle, empty
+            // rooms are handled by eviction below and do not need a leader.
+            if (room.hasLocalConnections() || room.hasBufferedUpdates()) {
+              const acquired = await this.bus.acquireLease(id, this.leaseMs);
+              if (acquired) {
+                room.setLeader(true);
+                // Capture any updates a crashed previous leader had in memory
+                // but never flushed. One full-state row is flushed next tick.
+                room.ingestLeadershipCheckpoint();
+              }
+            }
+          }
+        }
+      } catch (err) {
+        this.logger.error(
+          `Lease maintenance failed for ${id}: ${(err as Error).message}`,
+        );
+      }
+
+      // ---------------- durability (leader only) ----------------
+      try {
         if (room.shouldFlush(now)) {
           await room.flushUpdates();
         }
@@ -511,13 +730,12 @@ export class RoomManager implements OnModuleDestroy {
           await room.maybeSnapshot();
         }
       } catch (err) {
-        // Persistence is unavailable right now. The buffered updates stay in
-        // memory and are retried on the next tick; nothing is discarded.
         this.logger.error(
           `Persistence tick failed for ${id}: ${(err as Error).message}`,
         );
       }
 
+      // ---------------- idle eviction ----------------
       try {
         if (!room.isIdle(this.ttlMs)) continue;
         const retryAt = this.evictionRetryAt.get(id);
@@ -535,17 +753,17 @@ export class RoomManager implements OnModuleDestroy {
     }
   }
 
-  /**
-   * Evict an idle room. The in-memory Y.Doc is destroyed and the room is
-   * removed from the map ONLY after every buffered update has been durably
-   * flushed to Postgres (and compacted into S3). Any failure propagates so
-   * the caller keeps the room and retries later - never silently dropping
-   * edits and reverting reconnecting clients to an older document.
-   */
   private async evict(id: string): Promise<void> {
     const room = this.rooms.get(id);
     if (!room) return;
     await room.persistAllForEviction();
+    if (room.isLeader) {
+      await this.bus.releaseLease(id);
+      room.setLeader(false);
+    }
+    if (this.bus.enabled) {
+      await this.bus.unsubscribe(id);
+    }
     room.doc.destroy();
     this.rooms.delete(id);
     this.evictionRetryAt.delete(id);
@@ -553,10 +771,6 @@ export class RoomManager implements OnModuleDestroy {
   }
 
   async flushAll(): Promise<void> {
-    // Used on graceful shutdown. Best effort per room: log failures but
-    // attempt every document; a failed one is simply abandoned with the
-    // process (its in-memory edits were rebroadcast and are retried while
-    // the process keeps running until shutdown is forced).
     for (const [id] of this.rooms) {
       try {
         await this.evict(id);
@@ -571,5 +785,6 @@ export class RoomManager implements OnModuleDestroy {
   async onModuleDestroy(): Promise<void> {
     if (this.timer) clearInterval(this.timer);
     await this.flushAll();
+    await this.bus.stop();
   }
 }
