@@ -6,6 +6,8 @@ import {
   decodeBusMessage,
   docChannel,
   encodeBusMessage,
+  kickChannel,
+  KICK_PATTERN,
   lockKey,
   type BusMessageHeader,
 } from './collaboration-bus';
@@ -61,6 +63,10 @@ export class RedisCollaborationBus extends CollaborationBus {
     this.sub.on('message', (channel, message) => {
       this.onMessage(channel, Buffer.from(message, 'binary'));
     });
+    // Kick events arrive on per-user channels via one pattern subscription.
+    this.sub.on('pmessage', (_pattern, channel, message) => {
+      this.onKickMessage(channel, Buffer.from(message, 'binary'));
+    });
     this.sub.on('error', (err) => {
       this.logger.warn(`bus subscriber error: ${err.message}`);
     });
@@ -74,6 +80,7 @@ export class RedisCollaborationBus extends CollaborationBus {
     this.started = true;
     // ioredis connects lazily; explicitly wait for the subscriber channel.
     await Promise.all([this.pub.ping(), this.sub.ping()]);
+    await this.sub.psubscribe(KICK_PATTERN);
     this.logger.log(`Collaboration bus started as ${this.instanceId}`);
   }
 
@@ -116,6 +123,24 @@ export class RedisCollaborationBus extends CollaborationBus {
       case 'persisted':
         this.safeRun((h) => h.onPersisted(fileId, payload, header.i));
         break;
+    }
+  }
+
+  private onKickMessage(channel: string, raw: Buffer): void {
+    // collab:kick:<userId>; payload is "<instanceId>\n<reason>"
+    const prefix = 'collab:kick:';
+    if (!channel.startsWith(prefix)) return;
+    const userId = channel.slice(prefix.length);
+    const text = raw.toString('utf8');
+    const sep = text.indexOf('\n');
+    const fromInstance = sep === -1 ? text : text.slice(0, sep);
+    const reason = sep === -1 ? '' : text.slice(sep + 1);
+    if (fromInstance === this.instanceId) return; // ignore our own echo
+    if (!this.controlHandlers) return;
+    try {
+      this.controlHandlers.onKick(userId, reason, fromInstance);
+    } catch (err) {
+      this.logger.error(`kick handler failed: ${(err as Error).message}`);
     }
   }
 
@@ -167,6 +192,19 @@ export class RedisCollaborationBus extends CollaborationBus {
   }
   publishPersisted(fileId: string, stateVector: Uint8Array): Promise<void> {
     return this.publish('persisted', fileId, stateVector);
+  }
+
+  async publishKick(userId: string, reason: string): Promise<void> {
+    try {
+      await this.pub.publish(
+        kickChannel(userId),
+        `${this.instanceId}\n${reason}`,
+      );
+    } catch (err) {
+      // The local close happens regardless; remote instances may only learn
+      // of the removal on the user's next frame via per-frame authz anyway.
+      this.logger.warn(`kick publish failed: ${(err as Error).message}`);
+    }
   }
 
   async acquireLease(fileId: string, ttlMs: number): Promise<boolean> {

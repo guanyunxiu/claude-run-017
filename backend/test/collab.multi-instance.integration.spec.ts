@@ -6,6 +6,7 @@ import * as Y from 'yjs';
 import { WebsocketProvider } from 'y-websocket';
 import { CollaborationGateway } from '../src/collaboration/collaboration.gateway';
 import { RoomManager } from '../src/collaboration/room-manager';
+import { LiveSessionService } from '../src/collaboration/live-session.service';
 import { PresenceService } from '../src/collaboration/presence.service';
 import { PermissionService } from '../src/projects/permission.service';
 import { InMemoryCollaborationBus } from '../src/collaboration/bus/in-memory-collaboration-bus';
@@ -115,6 +116,7 @@ interface Backend {
   port: number;
   gateway: CollaborationGateway;
   rooms: RoomManager;
+  liveSessions: LiveSessionService;
 }
 
 async function waitFor<T>(
@@ -148,6 +150,7 @@ describe('Multi-instance collaboration (Redis backplane semantics)', () => {
 
   async function startBackend(): Promise<Backend> {
     const bus = new InMemoryCollaborationBus();
+    const liveSessions = new LiveSessionService(bus);
     const rooms = new RoomManager(
       prisma as never,
       storage as never,
@@ -162,6 +165,7 @@ describe('Multi-instance collaboration (Redis backplane semantics)', () => {
       rooms,
       // ROLE_CACHE_MS=0: live role changes apply immediately
       { get: (key: string, d: number) => (key === 'ROLE_CACHE_MS' ? 0 : d) } as never,
+      liveSessions,
     );
     const server = createServer();
     gateway.attach(server, '/collab');
@@ -172,6 +176,7 @@ describe('Multi-instance collaboration (Redis backplane semantics)', () => {
       port: (server.address() as { port: number }).port,
       gateway,
       rooms,
+      liveSessions,
     };
   }
 
@@ -452,5 +457,57 @@ describe('Multi-instance collaboration (Redis backplane semantics)', () => {
     expect(content.content).toContain('pre-election keystroke');
 
     client.provider.destroy();
+  });
+
+  it('cross-instance kick closes the victim socket regardless of which backend it landed on', async () => {
+    const fileId = 'f-cross-kick';
+    // Victim connects to backend 0, peer to backend 1.
+    const victim = connect(backends[0], 'editor-1', 'Victim', fileId);
+    const peer = connect(backends[1], 'editor-2', 'Peer', fileId);
+    await waitFor(
+      () => victim.provider.synced && peer.provider.synced,
+      (v) => v === true,
+      5000,
+      'both synced across instances',
+    );
+    await waitFor(
+      () => backends[0].liveSessions.count('editor-1'),
+      (v) => v >= 1,
+      3000,
+      'victim registered on backend 0',
+    );
+    expect(backends[1].liveSessions.count('editor-1')).toBe(0);
+
+    let victimCode = 0;
+    victim.provider.on('connection-close', (event: { code?: number } | null) => {
+      if (victimCode === 0) victimCode = event?.code ?? 0;
+    });
+
+    // The REST removal request is served by backend 1 (load balanced), but
+    // the victim's socket lives on backend 0. The bus kick must reach it.
+    permissions.setRole(fileId, 'editor-1', null);
+    const closedByCaller = await backends[1].liveSessions.kick(
+      'editor-1',
+      'removed from project',
+    );
+    // No local socket on the calling instance...
+    expect(closedByCaller).toBe(0);
+
+    // ...yet the socket on backend 0 closes with policy violation.
+    await waitFor(
+      () => victimCode,
+      (v) => v === 1008,
+      5000,
+      'victim on the other backend closed',
+    );
+    await waitFor(
+      () => backends[0].liveSessions.count('editor-1'),
+      (v) => v === 0,
+      3000,
+      'backend 0 registry cleared',
+    );
+
+    victim.provider.destroy();
+    peer.provider.destroy();
   });
 });

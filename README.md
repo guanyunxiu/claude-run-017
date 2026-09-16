@@ -227,14 +227,27 @@ Flow for `ws://host/collab/:fileId?token=...`:
    event re-broadcasts the update to every *other* socket.
 4. **Awareness**: client awareness updates are applied server-side and fanned
    out, yielding cursors/selections/name/color to all peers.
-5. **Live re-authorization**: the handshake role is only the *initial* value.
-   Before applying every mutation frame the gateway re-resolves the caller's
-   current role (a short per-document cache, `ROLE_CACHE_MS`, bounds DB load),
-   so an editor downgraded to viewer by an owner mid-session stops mutating on
-   the next keystroke without reconnecting; a user whose access is revoked
-   entirely is closed with code `1008`. If the permission store is briefly
-   unavailable the gateway fails closed (deny + reason frame).
-6. **Leave**: on `close` (or ping timeout) the client's awareness ids are
+5. **Live re-authorization applies to EVERY inbound frame, not just
+   writes.** Before processing a sync-step1 (document re-pull), a sync-update
+   (mutation), an awareness-query or an awareness frame (cursor/presence), the
+   gateway re-resolves the caller's current membership (a short per-document
+   cache, `ROLE_CACHE_MS`, bounds DB load). An editor downgraded to viewer
+   mid-session keeps read access but every mutation is answered with a `[4]`
+   denial frame; a member **removed from the project** has their socket closed
+   with code `1008` on their very next frame — they cannot silently re-pull the
+   full document, keep receiving traffic, or publish cursor state from an idle
+   connection. If the permission store is briefly unavailable the frame is
+   dropped (fail closed) but the socket is not closed during a transient
+   outage.
+6. **Proactive kick on removal.** Because a passive connection sends no
+   frames at all, role re-checks alone cannot evict a silent eavesdropper.
+   Removing a project member in the REST API calls `LiveSessionService.kick`,
+   which closes that user's sockets on the local instance immediately and
+   publishes a `collab:kick:<userId>` event through the bus so every other
+   backend closes the sockets it holds for the same user (no-op with the
+   single-instance bus). Broadcast loops already skip non-OPEN sockets, so
+   traffic to the victim stops the moment `close()` is issued.
+7. **Leave**: on `close` (or ping timeout) the client's awareness ids are
    removed — peers instantly see the cursor disappear — Redis presence is
    deleted, and after `ROOM_TTL_MS` idle the room flushes, snapshots and is
    evicted from memory.
@@ -242,7 +255,7 @@ Flow for `ws://host/collab/:fileId?token=...`:
 **Authorization is enforced on the data plane, not just the UI**: a viewer can
 complete the handshake (needed to *read*) but every sync-update frame they send
 is dropped and answered with a `[4]` denial frame instead of being applied or
-broadcast.
+broadcast. A non-member is closed with `1008` on any frame and on the upgrade.
 
 ### 5.2 Yjs persistence: Postgres update log + S3 snapshots
 
@@ -454,7 +467,7 @@ WS     /collab/:fileId?token=...         owner/editor may write, viewer read-onl
 
 ## 7. Tests
 
-### 7.1 Backend (64 tests)
+### 7.1 Backend (71 tests)
 
 ```bash
 cd backend && npm test
@@ -507,6 +520,9 @@ JWT/sessions are isolated like two real browsers) and asserts:
 - [x] Register, login, JWT-protected `/auth/me`
 - [x] Create/list projects; file tree; create/rename/delete/read files
 - [x] owner/editor/viewer enforced in backend (REST + WS) and reflected in UI
+- [x] Removing a member closes their live sockets (locally and across
+      instances) and every WS frame re-checks membership, so a stale
+      connection can neither re-pull the document nor publish awareness
 - [x] Monaco opens files with syntax highlighting and correct language
 - [x] WS join/leave/sync/broadcast per `documentId` room
 - [x] Yjs is the source of truth; concurrent clients converge (CRDT)
@@ -516,8 +532,8 @@ JWT/sessions are isolated like two real browsers) and asserts:
 - [x] Reconnect with backoff, dead-peer ping/pong, save/connection indicators,
       permission and sync error toasts
 - [x] Backend unit + HTTP integration + real WebSocket integration tests pass
-      (64/64), including a two-instance cross-backend convergence suite
-      and targeted no-leader-window / leader-loss / failed-publish regression tests
+      (71/71), including a two-instance cross-backend convergence suite,
+      cross-instance kick, and removed-member read/awareness rejection tests
 - [x] Playwright two-browser E2E provided and Docker-runnable
 - [x] `docker compose up --build` starts TWO backends, an internal load balancer,
       Postgres/Redis/MinIO and the frontend, with migrations and bucket

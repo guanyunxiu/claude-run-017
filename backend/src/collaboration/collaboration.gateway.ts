@@ -13,6 +13,7 @@ import * as decoding from 'lib0/decoding';
 import { PermissionService } from '../projects/permission.service';
 import { ProjectRole } from '../projects/roles';
 import { Room, RoomManager } from './room-manager';
+import { LiveSessionService } from './live-session.service';
 import {
   buildAwarenessUpdate,
   buildPermissionDenied,
@@ -90,6 +91,7 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     private readonly permissions: PermissionService,
     private readonly rooms: RoomManager,
     config: ConfigService,
+    private readonly liveSessions?: LiveSessionService,
   ) {
     this.roleCacheMs = config.get<number>('ROLE_CACHE_MS', 3000);
   }
@@ -251,6 +253,8 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     };
     room.connections.set(ws, conn);
     room.touch();
+    // Track by user so access revocation can proactively close the socket.
+    this.liveSessions?.register(user.sub, ws);
     // Minimise the window where a fresh room has no persistence leader: try
     // to acquire the lease immediately rather than waiting for the tick.
     void this.rooms.tryBecomeLeader(documentId);
@@ -319,11 +323,39 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
   ): Promise<void> {
     const { type, decoder } = readMessageType(data);
 
+    // ----------------------------------------------------------------
+    // ACCESS CONTROL applies to EVERY inbound frame, not just writes.
+    // A removed member must not be able to pull the document with a
+    // sync-step1, keep an idle eavesdropping socket, or publish cursor /
+    // awareness state. The short role cache (ROLE_CACHE_MS) bounds DB load
+    // while making removal effective within seconds even for a completely
+    // passive connection; the REST member-removal path also kicks sockets
+    // proactively across instances.
+    // ----------------------------------------------------------------
+    let role: ProjectRole | null;
+    try {
+      role = await this.resolveRole(conn.documentId, conn.userId);
+    } catch (err) {
+      // Transient permission-store failure: do not close (that would storm
+      // reconnects during an outage) but refuse to serve this frame; the
+      // client retries automatically.
+      this.logger.error(
+        `Role check failed for ${conn.userId}: ${(err as Error).message}`,
+      );
+      return;
+    }
+    if (role === null) {
+      this.invalidateRole(conn.documentId, conn.userId);
+      ws.close(1008, 'Access to this document was revoked');
+      return;
+    }
+    conn.role = role;
+
     if (type === MESSAGE_SYNC) {
       const syncType = decoding.readVarUint(decoder);
       if (syncType === SYNC_STEP_1) {
         const clientStateVector = decoding.readVarUint8Array(decoder);
-        // Viewers receive the document state but can never mutate it.
+        // Any current project member may read the current state.
         ws.send(room.encodeSyncStep1Response(clientStateVector));
         return;
       }
@@ -333,35 +365,7 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
         syncType === SYNC_UPDATE
       ) {
         const update = decoding.readVarUint8Array(decoder);
-
-        // Authorize against the CURRENT role, not the role captured at
-        // handshake time: an editor downgraded to viewer mid-session must
-        // stop mutating the document without needing to reconnect.
-        let role: ProjectRole | null;
-        try {
-          role = await this.resolveRole(conn.documentId, conn.userId);
-        } catch (err) {
-          // Fail closed: if the permission store is unavailable, refuse
-          // the write rather than silently accepting it.
-          this.logger.error(
-            `Role check failed for ${conn.userId}: ${(err as Error).message}`,
-          );
-          ws.send(
-            buildPermissionDenied(
-              'Temporarily unable to verify permissions, try again shortly',
-            ),
-          );
-          return;
-        }
-
-        if (role === null) {
-          // Access revoked entirely (removed from project / project deleted).
-          this.invalidateRole(conn.documentId, conn.userId);
-          ws.close(1008, 'Access to this document was revoked');
-          return;
-        }
-        conn.role = role;
-
+        // Mutation additionally requires editor+.
         if (role === 'viewer') {
           ws.send(
             buildPermissionDenied(
@@ -379,7 +383,7 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     }
 
     if (type === MESSAGE_QUERY_AWARENESS) {
-      // y-websocket may explicitly ask for current awareness states.
+      // Reading the room's awareness roster is member-only.
       const ids = Array.from(room.awareness.getStates().keys());
       if (ids.length > 0) {
         ws.send(buildAwarenessUpdate(room.awareness, ids));
@@ -388,14 +392,14 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     }
 
     if (type === MESSAGE_AWARENESS) {
-      // y-websocket frame: [MESSAGE_AWARENESS][length-prefixed awareness update]
+      // Publishing cursor/presence state is a member action. Removed users
+      // were closed above; a viewer MAY broadcast presence (read-only
+      // collaborators are still visible with their selections).
       const payload = decoding.readVarUint8Array(decoder);
       const addedClientIds = readChangedClientIds(payload);
-      // Apply + mirror to peers via the bus + refresh owned presence.
       room.applyClientAwareness(payload, ws);
       for (const id of addedClientIds) {
         const state = room.awareness.getStates().get(id);
-        // Only track clients that actually carry user state (y-monaco peers).
         if (state) {
           conn.docClientIds.add(id);
           room.clientIdToSocket.set(id, ws);
@@ -412,6 +416,7 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     conn: ConnectionMeta,
   ): void {
     room.connections.delete(ws);
+    this.liveSessions?.unregister(conn.userId, ws);
     const clientIds = Array.from(conn.docClientIds);
     if (clientIds.length > 0) {
       // Removes local awareness (broadcast + bus mirror inside the room) and

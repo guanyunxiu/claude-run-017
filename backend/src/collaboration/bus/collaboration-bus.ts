@@ -10,6 +10,9 @@
  * Document channels (one per file, carrying every message kind):
  *   collab:doc:<fileId>
  *
+ * Kick channel (one shared pattern subscription, per-user events):
+ *   collab:kick:<userId>        payload = plain UTF-8 reason
+ *
  * Persistence lease (single writer per document):
  *   collab:lock:doc:<fileId>   value = instanceId, TTL = leaseMs
  */
@@ -52,16 +55,30 @@ export interface BusHandlers {
   onPersisted(fileId: string, stateVector: Uint8Array, fromInstance: string): void;
 }
 
+/**
+ * Callbacks for access/control events that are not document scoped. Kept
+ * separate from BusHandlers because kick subscriptions are global.
+ */
+export interface BusControlHandlers {
+  /** A user was kicked (removed from a project); close their live sockets. */
+  onKick(userId: string, reason: string, fromInstance: string): void;
+}
+
 export abstract class CollaborationBus {
   abstract readonly instanceId: string;
   /** false for the single-instance no-op bus */
   abstract readonly enabled: boolean;
 
   protected handlers: BusHandlers | null = null;
+  protected controlHandlers: BusControlHandlers | null = null;
 
   /** Register message handlers. Called once by the RoomManager. */
   attachHandlers(handlers: BusHandlers): void {
     this.handlers = handlers;
+  }
+
+  attachControlHandlers(handlers: BusControlHandlers): void {
+    this.controlHandlers = handlers;
   }
 
   protected get h(): BusHandlers | null {
@@ -115,6 +132,13 @@ export abstract class CollaborationBus {
   abstract publishPersisted(fileId: string, stateVector: Uint8Array): Promise<void>;
 
   /**
+   * Tell every instance (including this one's peer services) to close all
+   * live sockets belonging to `userId`. Used when a member is removed from a
+   * project. No-op on the single-instance bus (the caller closes locally).
+   */
+  abstract publishKick(userId: string, reason: string): Promise<void>;
+
+  /**
    * Try to acquire (or renew when already owned) the persistence lease.
    * Returns true iff this instance currently owns the lease.
    */
@@ -129,6 +153,12 @@ export abstract class CollaborationBus {
 export function docChannel(fileId: string): string {
   return `collab:doc:${fileId}`;
 }
+
+export function kickChannel(userId: string): string {
+  return `collab:kick:${userId}`;
+}
+
+export const KICK_PATTERN = 'collab:kick:*';
 
 export function lockKey(fileId: string): string {
   return `collab:lock:doc:${fileId}`;

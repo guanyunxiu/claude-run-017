@@ -2,19 +2,19 @@ import { Module } from '@nestjs/common';
 import { CollaborationGateway } from './collaboration.gateway';
 import { RoomManager } from './room-manager';
 import { PresenceService } from './presence.service';
-import { collaborationBusProvider, COLLAB_BUS } from './bus/collaboration-bus.provider';
 import { ProjectsModule } from '../projects/projects.module';
 import { AuthModule } from '../auth/auth.module';
 import { StorageModule } from '../storage/storage.module';
 
+/**
+ * RealtimeModule (global) supplies the CollaborationBus and LiveSessionService
+ * singletons; this module provides the gateway, rooms and presence that use
+ * them. ProjectsModule can inject the same LiveSessionService without a
+ * projects <-> collaboration circular import.
+ */
 @Module({
   imports: [ProjectsModule, AuthModule, StorageModule],
-  providers: [
-    collaborationBusProvider,
-    CollaborationGateway,
-    RoomManager,
-    PresenceService,
-  ],
-  exports: [CollaborationGateway, RoomManager, PresenceService, COLLAB_BUS],
+  providers: [CollaborationGateway, RoomManager, PresenceService],
+  exports: [CollaborationGateway, RoomManager, PresenceService],
 })
 export class CollaborationModule {}

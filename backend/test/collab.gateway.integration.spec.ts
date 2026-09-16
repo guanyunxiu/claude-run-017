@@ -6,6 +6,7 @@ import { WebsocketProvider } from 'y-websocket';
 import { CollaborationGateway } from '../src/collaboration/collaboration.gateway';
 import { Room, RoomManager } from '../src/collaboration/room-manager';
 import { LocalCollaborationBus } from '../src/collaboration/bus/local-collaboration-bus';
+import { LiveSessionService } from '../src/collaboration/live-session.service';
 import { PresenceService } from '../src/collaboration/presence.service';
 import { PermissionService } from '../src/projects/permission.service';
 
@@ -155,12 +156,15 @@ describe('Collaboration WebSocket gateway (integration)', () => {
   let storage: FakeStorage;
   let jwt: JwtService;
   let permissions: FakePermissions;
+  let liveSessions: LiveSessionService;
 
   beforeAll(async () => {
     jwt = new JwtService({ secret: 'test-secret' });
     prisma = new FakePrisma();
     storage = new FakeStorage();
     permissions = new FakePermissions();
+    const bus = new LocalCollaborationBus();
+    liveSessions = new LiveSessionService(bus as never);
     const presence = new PresenceService(
       new FakeRedis() as never,
       { get: (_k: string, d: number) => d } as never,
@@ -183,7 +187,7 @@ describe('Collaboration WebSocket gateway (integration)', () => {
                   ? false
                   : d,
       } as never,
-      new LocalCollaborationBus(),
+      bus as never,
     );
     gateway = new CollaborationGateway(
       jwt,
@@ -191,6 +195,7 @@ describe('Collaboration WebSocket gateway (integration)', () => {
       rooms,
       // Zero role cache: a downgrade applies to the very next edit frame.
       { get: (key: string, d: number) => (key === 'ROLE_CACHE_MS' ? 0 : d) } as never,
+      liveSessions,
     );
 
     httpServer = createServer();
@@ -496,6 +501,128 @@ describe('Collaboration WebSocket gateway (integration)', () => {
 
     editor.provider.destroy();
     peer.provider.destroy();
+  });
+
+  it('BUG: a removed member cannot re-pull the document or publish awareness from a stale socket', async () => {
+    const roomId = 'r-removed-member';
+    const removed = connectClient('editor-1', 'Removed', '#f00', roomId);
+    const peer = connectClient('editor-2', 'Keeper', '#0f0', roomId);
+    await waitFor(
+      () => removed.provider.synced && peer.provider.synced,
+      (v) => v === true,
+      5000,
+      'both synced',
+    );
+
+    // Initial legitimate reads work.
+    peer.doc.getText('content').insert(0, 'secret content');
+    await waitFor(
+      () => removed.doc.getText('content').toString(),
+      (v) => v === 'secret content',
+      4000,
+      'removed member initially receives edits',
+    );
+
+    // Owner removes the member from the project (permissions now return null).
+    permissions.setRole(roomId, 'editor-1', null);
+    let closeCode = 0;
+    let closeReason = '';
+    removed.provider.on('connection-close', (event: { code?: number; reason?: string } | null) => {
+      closeCode = event?.code ?? 0;
+      closeReason = event?.reason ?? '';
+    });
+
+    // Even a pure READ request (re-pull of the full document via sync
+    // step1) must now be rejected: send a raw [0][0][empty-state-vector]
+    // frame exactly like y-websocket does at connect/resync.
+    const rawWs = removed.provider.ws as unknown as WsWebSocket;
+    rawWs.send(Buffer.concat([
+      Buffer.from([0, 0]),
+      Buffer.from([0]), // empty encoded state vector: varUint length 0
+    ]));
+
+    await waitFor(
+      () => closeCode,
+      (v) => v === 1008,
+      4000,
+      'stale socket closed on document re-pull',
+    );
+    expect(closeReason).toMatch(/revoked/i);
+
+    removed.provider.destroy();
+    peer.provider.destroy();
+  });
+
+  it('BUG: awareness from a removed member is rejected and closes the socket', async () => {
+    const roomId = 'r-removed-awareness';
+    const removed = connectClient('editor-2', 'RemovedAW', '#f00', roomId);
+    await waitFor(
+      () => removed.provider.synced,
+      (v) => v === true,
+      5000,
+      'synced',
+    );
+    permissions.setRole(roomId, 'editor-2', null);
+
+    let closeCode = 0;
+    removed.provider.on('connection-close', (event: { code?: number } | null) => {
+      closeCode = event?.code ?? 0;
+    });
+
+    // Trigger a real y-protocols awareness frame by changing the local
+    // awareness state (the user field is already present from connectClient).
+    removed.provider.awareness.setLocalStateField('note', 'cursor update');
+    await waitFor(
+      () => closeCode,
+      (v) => v === 1008,
+      4000,
+      'awareness frame closes the revoked socket',
+    );
+
+    removed.provider.destroy();
+  });
+
+  it('BUG: removing a member proactively closes their live socket without any frame from them', async () => {
+    const roomId = 'r-proactive-kick';
+    const victim = connectClient('editor-1', 'Victim', '#f00', roomId);
+    await waitFor(
+      () => victim.provider.synced,
+      (v) => v === true,
+      5000,
+      'synced',
+    );
+    // Connection registration happens inside the async 'connection' handler.
+    await waitFor(
+      () => liveSessions.count('editor-1'),
+      (v) => v >= 1,
+      3000,
+      'socket registered in live session registry',
+    );
+
+    let closeCode = 0;
+    victim.provider.on('connection-close', (event: { code?: number } | null) => {
+      // Capture only the FIRST close (1008 from the kick). y-websocket then
+      // auto-reconnects and those later attempts produce 1006 noise.
+      if (closeCode === 0) closeCode = event?.code ?? 0;
+    });
+
+    // The REST member-removal hook fires while the victim sends NOTHING.
+    permissions.setRole(roomId, 'editor-1', null);
+    const kicked = await liveSessions.kick(
+      'editor-1',
+      'You were removed from this project',
+    );
+    expect(kicked).toBe(1);
+    expect(liveSessions.count('editor-1')).toBe(0);
+
+    await waitFor(
+      () => closeCode,
+      (v) => v === 1008,
+      3000,
+      'live socket proactively closed with policy-violation',
+    );
+
+    victim.provider.destroy();
   });
 
   it('compacts S3 snapshots while a room stays continuously active', async () => {

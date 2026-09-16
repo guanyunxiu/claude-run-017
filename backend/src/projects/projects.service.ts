@@ -7,12 +7,14 @@ import { PrismaService } from '../common/prisma/prisma.service';
 import { CreateProjectDto } from './dto/create-project.dto';
 import { AddMemberDto } from './dto/add-member.dto';
 import { PermissionService } from './permission.service';
+import { LiveSessionService } from '../collaboration/live-session.service';
 
 @Injectable()
 export class ProjectsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly permissions: PermissionService,
+    private readonly liveSessions: LiveSessionService,
   ) {}
 
   async create(userId: string, dto: CreateProjectDto) {
@@ -170,10 +172,27 @@ export class ProjectsService {
     if (memberId === project.ownerId) {
       throw new ForbiddenException('Cannot remove the owner');
     }
+    // Resolve the membership row before deleting so we know which user's
+    // live sockets must be closed.
+    const membership = await this.prisma.projectMember.findUnique({
+      where: { id: memberId },
+      select: { userId: true, projectId: true },
+    });
     const removed = await this.prisma.projectMember.deleteMany({
       where: { id: memberId, projectId },
     });
     if (removed.count === 0) throw new NotFoundException('Member not found');
+
+    // Close every live collaboration socket belonging to the removed user,
+    // on this instance and (via the bus) on every other backend. Without
+    // this the removed member could keep reading documents, receiving live
+    // updates and publishing cursor state on an already-open connection.
+    if (membership && membership.projectId === projectId) {
+      await this.liveSessions.kick(
+        membership.userId,
+        'You were removed from this project',
+      );
+    }
     return { ok: true };
   }
 

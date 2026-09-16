@@ -101,6 +101,7 @@ class ScriptedBus extends CollaborationBus {
   publishPersisted(f: string, u: Uint8Array) {
     return this.record('persisted', u);
   }
+  async publishKick() {}
   async acquireLease() {
     return true; // tests drive leadership manually
   }

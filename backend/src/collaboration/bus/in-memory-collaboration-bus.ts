@@ -21,6 +21,8 @@ export class InMemoryCollaborationBus extends CollaborationBus {
   private static readonly instances = new Set<InMemoryCollaborationBus>();
   private static readonly channels = new Map<string, Set<InMemoryCollaborationBus>>();
   private static readonly locks = new Map<string, { owner: string; expiresAt: number }>();
+  /** userId -> instance ids with an attached control handler */
+  private static readonly kickSubscribers = new Set<InMemoryCollaborationBus>();
 
   private listeners = new Map<string, number>();
   private readonly now: () => number;
@@ -33,7 +35,7 @@ export class InMemoryCollaborationBus extends CollaborationBus {
   }
 
   async start(): Promise<void> {
-    // noop
+    InMemoryCollaborationBus.kickSubscribers.add(this);
   }
 
   private emit(channel: string, raw: Buffer, sender: InMemoryCollaborationBus) {
@@ -115,6 +117,16 @@ export class InMemoryCollaborationBus extends CollaborationBus {
     return this.send(fileId, this.frame('persisted', stateVector, {}));
   }
 
+  async publishKick(userId: string, reason: string): Promise<void> {
+    // Redis delivers to ALL subscribers except via instance-id filtering;
+    // the local kicker handles its own sockets directly (it does not even
+    // subscribe), so deliver only to OTHER instances here.
+    for (const peer of InMemoryCollaborationBus.kickSubscribers) {
+      if (peer === this) continue;
+      peer.controlHandlers?.onKick(userId, reason, this.instanceId);
+    }
+  }
+
   private frame(kind: BusMessageKind, payload: Uint8Array, extra: { t?: string }): Buffer {
     return encodeBusMessage(kind, payload, { i: this.instanceId, ...extra });
   }
@@ -153,6 +165,7 @@ export class InMemoryCollaborationBus extends CollaborationBus {
 
   async stop(): Promise<void> {
     InMemoryCollaborationBus.instances.delete(this);
+    InMemoryCollaborationBus.kickSubscribers.delete(this);
     for (const [channel, peers] of InMemoryCollaborationBus.channels) {
       peers.delete(this);
       if (peers.size === 0) InMemoryCollaborationBus.channels.delete(channel);
@@ -164,6 +177,7 @@ export class InMemoryCollaborationBus extends CollaborationBus {
     InMemoryCollaborationBus.instances.clear();
     InMemoryCollaborationBus.channels.clear();
     InMemoryCollaborationBus.locks.clear();
+    InMemoryCollaborationBus.kickSubscribers.clear();
   }
 
   static expireLocksForTest(): void {

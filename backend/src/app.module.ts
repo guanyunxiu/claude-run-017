@@ -6,6 +6,7 @@ import { AuthModule } from './auth/auth.module';
 import { ProjectsModule } from './projects/projects.module';
 import { FilesModule } from './files/files.module';
 import { CollaborationModule } from './collaboration/collaboration.module';
+import { RealtimeModule } from './collaboration/realtime.module';
 import { StorageModule } from './storage/storage.module';
 import { HealthController } from './health.controller';
 
@@ -15,6 +16,7 @@ import { HealthController } from './health.controller';
     PrismaModule,
     RedisModule,
     StorageModule,
+    RealtimeModule,
     AuthModule,
     ProjectsModule,
     FilesModule,
