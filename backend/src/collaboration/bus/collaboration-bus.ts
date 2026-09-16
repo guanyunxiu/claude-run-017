@@ -18,7 +18,8 @@ export type BusMessageKind =
   | 'doc-update'
   | 'awareness'
   | 'sync-step1'
-  | 'sync-step2';
+  | 'sync-step2'
+  | 'persisted';
 
 export interface BusMessageHeader {
   /** sending instance id */
@@ -43,6 +44,12 @@ export interface BusHandlers {
     targetInstance: string,
     fromInstance: string,
   ): void;
+  /**
+   * Leader broadcast after a successful flush. Payload is the leader's Yjs
+   * state vector; followers use it to confirm their locally-originated
+   * updates are durable and to prune their safety buffers.
+   */
+  onPersisted(fileId: string, stateVector: Uint8Array, fromInstance: string): void;
 }
 
 export abstract class CollaborationBus {
@@ -81,6 +88,9 @@ export abstract class CollaborationBus {
       case 'sync-step2':
         this.handlers.onSyncStep2(fileId, payload, header.t ?? '', header.i);
         break;
+      case 'persisted':
+        this.handlers.onPersisted(fileId, payload, header.i);
+        break;
     }
   }
 
@@ -101,6 +111,8 @@ export abstract class CollaborationBus {
     update: Uint8Array,
     targetInstance: string,
   ): Promise<void>;
+  /** Broadcast that the leader durably flushed up to this state vector. */
+  abstract publishPersisted(fileId: string, stateVector: Uint8Array): Promise<void>;
 
   /**
    * Try to acquire (or renew when already owned) the persistence lease.
@@ -132,6 +144,7 @@ const KIND_CODES: Record<BusMessageKind, number> = {
   awareness: 2,
   'sync-step1': 3,
   'sync-step2': 4,
+  persisted: 5,
 };
 const CODE_KINDS: Record<number, BusMessageKind> = Object.fromEntries(
   Object.entries(KIND_CODES).map(([k, v]) => [v, k as BusMessageKind]),

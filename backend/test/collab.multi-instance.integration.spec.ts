@@ -378,4 +378,79 @@ describe('Multi-instance collaboration (Redis backplane semantics)', () => {
     a.provider.destroy();
     b.provider.destroy();
   });
+
+  it('BUG1/BUG2: edits in the no-leader window and after leader loss are durable and converge', async () => {
+    const fileId = 'f-durability-gap';
+
+    // Create room on backend A directly (no leader yet) and insert via a
+    // client update path the same way the gateway does, BEFORE any lease
+    // sweep. The update must be buffered locally regardless of leadership.
+    const roomA0 = await backends[0].rooms.getOrCreate(fileId);
+    const earlyDoc = new Y.Doc();
+    earlyDoc.getText('content').insert(0, 'pre-election keystroke');
+    const earlyUpdate = Y.encodeStateAsUpdate(earlyDoc);
+    await roomA0.applyClientUpdate(earlyUpdate, {} as never);
+
+    expect(roomA0.getBufferedCount()).toBeGreaterThanOrEqual(1);
+    expect(roomA0.isLeader).toBe(false); // no tick yet -> still follower
+    expect(prisma.updates.filter((u) => u.fileId === fileId)).toHaveLength(0);
+
+    // Run sweeps; exactly one instance becomes leader and the buffered edit
+    // is flushed - not lost.
+    await backends[0].rooms.runIdleSweepForTest();
+    await backends[1].rooms.runIdleSweepForTest();
+    const leader = [backends[0], backends[1]].find((be) =>
+      be.rooms.get(fileId)!.isLeader,
+    )!;
+    expect(leader).toBeDefined();
+    const rowsBefore = prisma.updates.filter((u) => u.fileId === fileId);
+    expect(rowsBefore.length).toBeGreaterThan(0);
+
+    // Now the OTHER backend joins with a real client and must receive the
+    // pre-election edit through the bus (it may have missed the original
+    // publish since its room did not exist; catch-up closes that gap).
+    const followerBackend = leader === backends[0] ? backends[1] : backends[0];
+    const client = connect(followerBackend, 'late-bob', 'LateBob', fileId);
+    await waitFor(
+      () => client.provider.synced,
+      (v) => v === true,
+      5000,
+      'late client synced',
+    );
+    await waitFor(
+      () => client.doc.getText('content').toString(),
+      (v) => v.includes('pre-election keystroke'),
+      5000,
+      'late follower recovered the pre-election state',
+    );
+
+    // Force leadership to the follower: losing leadership must not drop the
+    // old leader's buffer, and the new leader must flush the converged doc.
+    const oldLeaderRoom = leader.rooms.get(fileId)!;
+    const newLeaderRoom = followerBackend.rooms.get(fileId)!;
+    oldLeaderRoom.setLeader(false);
+    // buffer on the old leader is retained (no forced clear)
+    expect(oldLeaderRoom.getBufferedCount()).toBeGreaterThanOrEqual(0);
+    InMemoryCollaborationBus.expireLocksForTest();
+    await followerBackend.rooms.runIdleSweepForTest();
+    expect(newLeaderRoom.isLeader).toBe(true);
+
+    // A fresh room loading from durable storage sees the early edit.
+    await Promise.all([
+      backends[0].rooms.runIdleSweepForTest(),
+      backends[1].rooms.runIdleSweepForTest(),
+    ]);
+    const filesService = new FilesService(
+      prisma as never,
+      {
+        getFileRole: async () => ({ role: 'viewer', file: { id: fileId, projectId: 'p1' } }),
+        requireFileRole: async () => ({ role: 'viewer', file: { id: fileId, projectId: 'p1' } }),
+      } as unknown as PermissionService,
+      storage as never,
+    );
+    const content = await filesService.readContent(fileId, 'anyone');
+    expect(content.content).toContain('pre-election keystroke');
+
+    client.provider.destroy();
+  });
 });

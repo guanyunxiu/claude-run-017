@@ -24,6 +24,7 @@ export class LocalCollaborationBus extends CollaborationBus {
     _update: Uint8Array,
     _target: string,
   ): Promise<void> {}
+  async publishPersisted(_fileId: string, _stateVector: Uint8Array): Promise<void> {}
 
   async acquireLease(fileId: string): Promise<boolean> {
     this.ownedLeases.add(fileId);

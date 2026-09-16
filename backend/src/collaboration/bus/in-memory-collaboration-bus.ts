@@ -76,6 +76,8 @@ export class InMemoryCollaborationBus extends CollaborationBus {
       this.h.onSyncStep1(fileId, payload, header.i);
     else if (kind === 'sync-step2' && header.t === this.instanceId)
       this.h.onSyncStep2(fileId, payload, this.instanceId, header.i);
+    else if (kind === 'persisted')
+      this.h.onPersisted(fileId, payload, header.i);
   }
 
   async unsubscribe(fileId: string): Promise<void> {
@@ -108,6 +110,9 @@ export class InMemoryCollaborationBus extends CollaborationBus {
   }
   publishSyncStep2(fileId: string, update: Uint8Array, target: string): Promise<void> {
     return this.send(fileId, this.frame('sync-step2', update, { t: target }));
+  }
+  publishPersisted(fileId: string, stateVector: Uint8Array): Promise<void> {
+    return this.send(fileId, this.frame('persisted', stateVector, {}));
   }
 
   private frame(kind: BusMessageKind, payload: Uint8Array, extra: { t?: string }): Buffer {

@@ -113,6 +113,9 @@ export class RedisCollaborationBus extends CollaborationBus {
           );
         }
         break;
+      case 'persisted':
+        this.safeRun((h) => h.onPersisted(fileId, payload, header.i));
+        break;
     }
   }
 
@@ -161,6 +164,9 @@ export class RedisCollaborationBus extends CollaborationBus {
   }
   publishSyncStep2(fileId: string, update: Uint8Array, targetInstance: string): Promise<void> {
     return this.publish('sync-step2', fileId, update, targetInstance);
+  }
+  publishPersisted(fileId: string, stateVector: Uint8Array): Promise<void> {
+    return this.publish('persisted', fileId, stateVector);
   }
 
   async acquireLease(fileId: string, ttlMs: number): Promise<boolean> {

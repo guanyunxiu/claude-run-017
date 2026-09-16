@@ -34,6 +34,31 @@ export interface RoomConnection {
 interface BufferEntry {
   update: Uint8Array;
   size: number;
+  /**
+   * Where the update originated. `local` entries were produced by a socket on
+   * THIS instance and must survive follower/leader churn until the leader
+   * confirms them durable (they are the safety net for no-leader windows and
+   * failed/delayed bus delivery). `bus` entries arrived from another instance
+   * and are buffered only while this room is the leader so it can flush the
+   * converged document.
+   */
+  origin: 'local' | 'bus';
+}
+
+/**
+ * True when `remoteVector` contains every clock that `localVector` does.
+ * Yjs state vectors are Map<clientId, clock>; a document at `remoteVector`
+ * therefore already includes every update that produced `localVector`.
+ */
+function stateVectorCovers(
+  localVector: Map<number, number>,
+  remoteVector: Uint8Array,
+): boolean {
+  const remote = Y.decodeStateVector(remoteVector) as Map<number, number>;
+  for (const [clientId, clock] of localVector) {
+    if ((remote.get(clientId) ?? 0) < clock) return false;
+  }
+  return true;
 }
 
 /** Updates replayed from storage on room load: neither broadcast nor persisted. */
@@ -63,6 +88,13 @@ export class Room {
 
   private buffer: BufferEntry[] = [];
   private bufferBytes = 0;
+  /**
+   * doc updates captured locally but not yet acknowledged as delivered to
+   * another backend over the bus. They are also in `buffer`; this queue
+   * exists to retry Redis publishes in order.
+   */
+  private pendingPublishes: Uint8Array[] = [];
+  private publishing = false;
   private lastFlush = Date.now();
   private lastSnapshot = Date.now();
   private lastActivity = Date.now();
@@ -99,7 +131,6 @@ export class Room {
     this.doc.on('update', (update: Uint8Array, origin: unknown) => {
       const fromStorage = origin === ROOM_LOAD_ORIGIN;
       const fromBus = origin === BUS_ORIGIN;
-      void fromBus;
 
       // Broadcast to local peers except the originator (a websocket). Storage
       // replay is never echoed; bus-relayed updates go to every local socket.
@@ -111,17 +142,32 @@ export class Room {
         }
       }
 
-      // Single-writer persistence: the leader is the ONLY instance that
-      // writes, and it persists every update that advanced its converged
-      // document - regardless of whether it originated on a local socket or
-      // arrived from another instance via the bus. Followers never write.
-      // Bus updates are therefore buffered on the leader (but still not
-      // re-published to the bus, so there is no loop and no duplicated rows:
-      // the originating follower is by definition a non-leader).
-      if (this.isLeader && !fromStorage) {
-        this.buffer.push({ update, size: update.byteLength });
-        this.bufferBytes += update.byteLength;
+      if (fromStorage) {
+        this.lastActivity = Date.now();
+        return;
       }
+
+      // DURABILITY MODEL
+      // --------------
+      // Every update that advanced this document is buffered locally, no
+      // matter whether we currently hold the persistence lease:
+      //
+      //  - local-origin updates (from a connected socket) are ALWAYS buffered
+      //    as 'local'. They cannot be dropped during the no-leader window
+      //    (before the first lease is acquired / during a lease handover) nor
+      //    when Redis publish fails. The leader will flush them directly; as a
+      //    follower they stay until a leader 'persisted' state vector confirms
+      //    durability (or this instance wins the lease and flushes itself).
+      //  - bus-origin updates are buffered as 'bus' only while we are the
+      //    leader, so the single writer can flush the fully converged document
+      //    (including edits that originated on other instances). Followers
+      //    must not flush those - the originating peer owns their durability.
+      this.buffer.push({
+        update,
+        size: update.byteLength,
+        origin: fromBus ? 'bus' : 'local',
+      });
+      this.bufferBytes += update.byteLength;
       this.lastActivity = Date.now();
     });
 
@@ -242,12 +288,43 @@ export class Room {
   }
 
   // ------------------------------------------------ ingress from websocket
-  /** Apply an update sent by a locally connected client and mirror it to peers. */
-  applyClientUpdate(update: Uint8Array, origin: WebSocket): void {
+  /**
+   * Apply an update from a locally connected client and durably hand it to
+   * peer backends. The update is already in the persistence buffer by the
+   * time this runs (the doc 'update' listener put it there), so a failed
+   * publish never loses it: it stays in `pendingPublishes` and is retried in
+   * order on every tick until acknowledged by Redis.
+   */
+  async applyClientUpdate(update: Uint8Array, origin: WebSocket): Promise<void> {
     Y.applyUpdate(this.doc, update, origin);
     if (this.bus.enabled) {
-      void this.bus.publishDocUpdate(this.documentId, update);
+      this.pendingPublishes.push(update);
+      await this.drainPendingPublishes();
     }
+  }
+
+  /** Retry any bus publishes that failed previously (in order). */
+  async drainPendingPublishes(): Promise<void> {
+    if (this.publishing || this.pendingPublishes.length === 0) return;
+    this.publishing = true;
+    try {
+      while (this.pendingPublishes.length > 0) {
+        const next = this.pendingPublishes[0];
+        await this.bus.publishDocUpdate(this.documentId, next);
+        this.pendingPublishes.shift();
+      }
+    } catch (err) {
+      // Keep the remainder queued; the next tick retries.
+      this.logger.warn(
+        `bus publish failed (${this.pendingPublishes.length} queued): ${(err as Error).message}`,
+      );
+    } finally {
+      this.publishing = false;
+    }
+  }
+
+  hasPendingPublishes(): boolean {
+    return this.pendingPublishes.length > 0;
   }
 
   // ----------------------------------------------------- awareness ingress
@@ -272,8 +349,8 @@ export class Room {
 
   // ----------------------------------------------------- ingress from bus
   applyBusUpdate(update: Uint8Array): void {
-    // Origin = bus marker: broadcast to local sockets, never re-publish and
-    // (on the leader) never re-buffer because the originating leader persisted.
+    // Origin = bus marker: broadcast to local sockets, never re-publish.
+    // The 'update' listener buffers it as a 'bus' entry while we are leader.
     Y.applyUpdate(this.doc, update, BUS_ORIGIN);
   }
 
@@ -299,7 +376,6 @@ export class Room {
     this.flushing = true;
     const entries = this.buffer;
     this.buffer = [];
-    const byteCount = this.bufferBytes;
     this.bufferBytes = 0;
 
     try {
@@ -321,14 +397,24 @@ export class Room {
       this.bytesAwaitingSnapshot += merged.byteLength;
       this.lastFlush = Date.now();
       this.logger.debug(
-        `Flushed ${entries.length} update(s), ${merged.byteLength} bytes (unmerged ${byteCount})`,
+        `Flushed ${entries.length} update(s), ${merged.byteLength} bytes`,
       );
       await this.broadcastSavedAt();
+      // Tell followers exactly which clocks are now durable so they can drop
+      // their local safety buffers. Fire-and-forget is acceptable here: if
+      // this publish is lost the follower simply keeps (and, if needed,
+      // later re-flushes as the new leader) the redundant updates - no loss.
+      if (this.bus.enabled) {
+        void this.bus.publishPersisted(
+          this.documentId,
+          Y.encodeStateVector(this.doc),
+        );
+      }
       return entries.length;
     } catch (err) {
-      // Put entries back for retry on the next tick.
+      // Put entries back for retry on the next tick. Preserve order.
       this.buffer.unshift(...entries);
-      this.bufferBytes += byteCount;
+      this.bufferBytes += entries.reduce((n, e) => n + e.size, 0);
       this.logger.error(`Flush failed: ${(err as Error).message}`);
       throw err;
     } finally {
@@ -424,6 +510,16 @@ export class Room {
     );
   }
 
+  /** Unconfirmed local edits a follower room still must not lose. */
+  hasUnconfirmedLocalEdits(): boolean {
+    return this.buffer.some((e) => e.origin === 'local');
+  }
+
+  /** Buffer entries broken down for tests/operations. */
+  bufferedOrigins(): Array<'local' | 'bus'> {
+    return this.buffer.map((e) => e.origin);
+  }
+
   /**
    * Durability barrier before a leader room is destroyed. Postgres flush is
    * the hard requirement; S3 compaction failure must not block eviction since
@@ -431,6 +527,8 @@ export class Room {
    */
   async persistAllForEviction(): Promise<void> {
     if (this.isLeader) {
+      // Retry any bus publishes first so peers converge before we stop.
+      await this.drainPendingPublishes();
       await this.flushUpdates();
       if (this.bytesAwaitingSnapshot > 0) {
         try {
@@ -445,44 +543,109 @@ export class Room {
         await this.flushUpdates();
       }
     }
+    // A follower with unconfirmed local edits cannot be safely evicted:
+    // flushing is the leader's job, and dropping them would lose keystrokes
+    // that never reached durable storage. Caller should retry (it will either
+    // receive a leader 'persisted' vector or win the lease on a later tick).
   }
 
   // ------------------------------------------------------------- leadership
   setLeader(leader: boolean): void {
     if (leader && !this.isLeader) {
       this.logger.log('Became persistence leader for this document');
+      // We now own the single-writer lease. The buffer already contains
+      // every converged update (local edits AND bus-relayed edits received
+      // while a follower); force an immediate flush so the takeover closes
+      // any durability gap left by a crashed previous leader.
+      if (this.buffer.length > 0) this.lastFlush = 0;
     } else if (!leader && this.isLeader) {
-      this.logger.warn('Lost persistence leadership; dropping local buffer');
-      // Another instance owns the lease now. Discard any unflushed buffer so
-      // we cannot double-write; the new leader holds the converged state via
-      // the bus (and persisted rows survive regardless).
-      this.buffer = [];
-      this.bufferBytes = 0;
+      this.logger.warn(
+        'Lost persistence leadership; retaining unconfirmed local buffer',
+      );
+      // IMPORTANT: do NOT clear the buffer here. Another instance now owns
+      // the lease, but our own local-origin edits may not have been flushed
+      // by the previous (us) leader nor yet confirmed durable. They remain
+      // buffered until the new leader's 'persisted' vector confirms them;
+      // 'bus' entries belonging to peers are pruned by the same mechanism.
+      // If this instance wins the lease back, it flushes them itself.
     }
     this.isLeader = leader;
   }
 
-  /** Any unflushed local edits (only meaningful on the leader). */
+  /**
+   * Called when a leader announces it durably flushed up to `leaderVector`.
+   * As a follower we can then release:
+   *  - all 'bus' entries (already persisted by definition), and
+   *  - every 'local' entry whose clocks are covered by the leader vector.
+   * Local entries still outstanding (e.g. published just after the flush)
+   * are retained. Entries are causally ordered, so we replay them once into a
+   * scratch document and find the coverage cutoff rather than decoding each
+   * update independently.
+   */
+  onLeaderPersisted(leaderVector: Uint8Array): void {
+    if (this.isLeader || this.buffer.length === 0) return;
+    // Determine how many leading LOCAL entries are already covered by the
+    // leader's state vector. We replay local entries in arrival order into a
+    // scratch document; once coverage breaks we stop because later entries
+    // cannot be covered before the cutoff. 'bus' entries are always dropped
+    // here (the leader is the single writer for peers' edits).
+    const scratch = new Y.Doc();
+    let coveredLocalCount = 0;
+    for (const entry of this.buffer) {
+      if (entry.origin !== 'local') continue;
+      Y.applyUpdate(scratch, entry.update, ROOM_LOAD_ORIGIN);
+      const scratchVector = Y.decodeStateVector(
+        Y.encodeStateVector(scratch),
+      ) as Map<number, number>;
+      if (!stateVectorCovers(scratchVector, leaderVector)) break;
+      coveredLocalCount++;
+    }
+    scratch.destroy();
+
+    if (coveredLocalCount === 0) {
+      // Only bus entries (if any) can be removed.
+      const kept = this.buffer.filter((e) => e.origin === 'local');
+      if (kept.length !== this.buffer.length) {
+        this.buffer = kept;
+        this.bufferBytes = kept.reduce((n, e) => n + e.size, 0);
+      }
+      return;
+    }
+
+    // Drop all bus entries plus the first `coveredLocalCount` local entries.
+    let seenLocal = 0;
+    const kept = this.buffer.filter((e) => {
+      if (e.origin === 'bus') return false;
+      seenLocal++;
+      return seenLocal > coveredLocalCount;
+    });
+    if (kept.length !== this.buffer.length) {
+      this.buffer = kept;
+      this.bufferBytes = kept.reduce((n, e) => n + e.size, 0);
+    }
+  }
+
+  /** Any buffered updates not yet confirmed durable (follower safety net). */
   hasBufferedUpdates(): boolean {
     return this.buffer.length > 0;
   }
 
   /**
-   * Called by the manager the moment this instance wins leadership. The room
-   * already holds the converged document state (storage load + every update
-   * relayed over the bus while it was a follower), but bus-origin updates were
-   * deliberately NOT buffered (only the then-leader persisted them). If that
-   * previous leader crashed before flushing, its unflushed delta exists only in
-   * peer memory. We therefore enqueue the FULL current state for one immediate
-   * flush. It is pushed straight into the persistence buffer - never applied
-   * to the doc - so it is not broadcast to already-converged clients; Yjs CRDT
-   * idempotency makes the redundant content harmless on replay.
+   * Called by the manager the moment this instance wins leadership. Retained
+   * for the takeover flush; the buffer already holds the converged state, so
+   * an immediate shouldFlush is scheduled via setLeader(). This enqueues the
+   * FULL current document as one update to guarantee capture of any delta a
+   * crashed prior leader had applied but not flushed.
    */
   ingestLeadershipCheckpoint(): void {
+    // Avoid stacking full-state checkpoints if the buffer already contains
+    // every clock: a fresh leader's buffer normally suffices, but if the room
+    // was created purely from storage with no buffered traffic yet there is
+    // nothing new to persist.
     const full = Y.encodeStateAsUpdate(this.doc);
-    this.buffer.push({ update: full, size: full.byteLength });
+    this.buffer.push({ update: full, size: full.byteLength, origin: 'bus' });
     this.bufferBytes += full.byteLength;
-    this.lastFlush = 0; // make shouldFlush() due on the next tick
+    this.lastFlush = 0; // make shouldFlush() due immediately
   }
 
   // --------------------------------------------------------------- presence
@@ -599,6 +762,9 @@ export class RoomManager implements OnModuleInit, OnModuleDestroy {
       onSyncStep2: (fileId, update) => {
         this.rooms.get(fileId)?.applyBusSyncStep2(update);
       },
+      onPersisted: (fileId, stateVector) => {
+        this.rooms.get(fileId)?.onLeaderPersisted(stateVector);
+      },
     });
 
     const autoPersist = config.get<boolean>('COLLAB_AUTO_PERSIST', true);
@@ -677,6 +843,28 @@ export class RoomManager implements OnModuleInit, OnModuleDestroy {
     return this.rooms.size;
   }
 
+  /**
+   * Attempt to acquire the persistence lease for a document right after the
+   * first client connects. This collapses the no-leader window to near zero
+   * instead of waiting up to one tick interval; only one instance wins.
+   */
+  async tryBecomeLeader(documentId: string): Promise<void> {
+    if (!this.bus.enabled) return;
+    const room = this.rooms.get(documentId);
+    if (!room || room.isLeader) return;
+    try {
+      const acquired = await this.bus.acquireLease(documentId, this.leaseMs);
+      if (acquired) {
+        room.setLeader(true);
+        room.ingestLeadershipCheckpoint();
+      }
+    } catch (err) {
+      this.logger.warn(
+        `Immediate lease campaign failed for ${documentId}: ${(err as Error).message}`,
+      );
+    }
+  }
+
   /** Test hook: run exactly one persistence + leadership + eviction pass. */
   async runIdleSweepForTest(): Promise<void> {
     await this.tick();
@@ -696,6 +884,11 @@ export class RoomManager implements OnModuleInit, OnModuleDestroy {
       // With the in-process bus there is only one instance, so every room is
       // leader from birth and no lease negotiation runs (phase-1 behaviour).
       try {
+        // Retry bus publishes that previously failed before anything else so
+        // peers converge even through transient Redis outages.
+        if (this.bus.enabled) {
+          await room.drainPendingPublishes();
+        }
         if (this.bus.enabled) {
           if (room.isLeader) {
             const renewed = await this.bus.renewLease(id, this.leaseMs);
@@ -740,6 +933,31 @@ export class RoomManager implements OnModuleInit, OnModuleDestroy {
         if (!room.isIdle(this.ttlMs)) continue;
         const retryAt = this.evictionRetryAt.get(id);
         if (retryAt !== undefined && now < retryAt) continue;
+
+        // A follower holding local edits the leader has not yet confirmed
+        // durable MUST NOT be evicted (that would drop them). Try to take
+        // over and flush ourselves; otherwise wait for the leader's
+        // 'persisted' vector or a later lease win.
+        if (
+          this.bus.enabled &&
+          !room.isLeader &&
+          (room.hasUnconfirmedLocalEdits() || room.hasPendingPublishes())
+        ) {
+          const acquired = await this.bus.acquireLease(id, this.leaseMs);
+          if (acquired) {
+            room.setLeader(true);
+            room.ingestLeadershipCheckpoint();
+            await room.drainPendingPublishes();
+            await room.flushUpdates();
+          } else {
+            this.evictionRetryAt.set(
+              id,
+              Date.now() + RoomManager.EVICTION_RETRY_DELAY_MS,
+            );
+            continue;
+          }
+        }
+
         await this.evict(id);
       } catch (err) {
         this.logger.error(

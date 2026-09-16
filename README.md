@@ -341,33 +341,58 @@ kind, an instance-id header and the binary payload:
 - `doc-update` — a Yjs update produced by a locally connected client.
 - `awareness` — encoded awareness (cursor/selection/user state).
 - `sync-step1` / `sync-step2` — targeted bootstrapping (see below).
+- `persisted` — a state vector the leader broadcasts after every successful
+  flush so followers can release their local safety buffers.
 
-Each update has two transaction origins the room distinguishes: a **local
-socket** and the **bus marker**. The rules guarantee no loops and exactly one
-persistence writer:
+**No-loss persistence model (important).** Updates are buffered locally on
+the instance that applies them **regardless of its current leadership state**,
+tagged by origin:
 
-1. A client on instance A sends an update → A applies it with the socket as
-   origin, broadcasts to its other local sockets, and publishes it to Redis.
+- `local` entries come from a socket on this instance. They are buffered from
+  the instant the update is applied — before any lease is acquired, through
+  no-leader windows, and while a follower — so a keystroke can never live only
+  in the transient `Y.Doc`. Local publishes go through an in-order retry
+  queue: a failed `PUBLISH` does not drop the update (it is re-tried on every
+  tick), and the update stays buffered until durability is confirmed.
+- `bus` entries arrived from another instance. A leader buffers them so it can
+  flush the fully converged document; a follower never flushes them.
+
+Flow:
+
+1. A client on instance A sends an update → A applies it (the doc listener
+   buffers it as `local`), broadcasts to its other local sockets, and
+   publishes it to Redis via the retry queue.
 2. Instances B/C receive the frame, skip their own instance id, and apply it
    with the `BUS` origin. That fans the update out to their local sockets but
-   they never publish it back to Redis (no ping-pong loop).
+   they never publish it back (no ping-pong). On the elected leader it is
+   buffered as `bus`; on followers it only updates the in-memory document.
 3. **Single persistence writer.** Each document has one elected leader, keyed
    `collab:lock:doc:<fileId>` (a Redis key with `PX` TTL set/renewed through a
-   compare-value Lua script). The leader buffers every converged update —
-   including bus-relayed ones — and flushes merged updates to Postgres and
-   compacts S3 snapshots exactly as in single-instance mode. Followers never
-   write, so the update log is never doubled. Leader + followers still hold
-   the *same converged document*, because every update crosses the bus.
+   compare-value Lua script). The leader flushes its merged buffer (local +
+   bus = converged state) to Postgres and compacts S3 snapshots exactly as in
+   single-instance mode. Followers never write, so the log is never doubled.
+4. After each successful flush the leader publishes a `persisted` frame with
+   its state vector. A follower then drops its `bus` entries and the prefix of
+   `local` entries whose clocks are covered by that vector; local entries not
+   yet confirmed remain buffered.
+5. Losing leadership **never clears the buffer**. The demoted instance simply
+   becomes a follower: it waits for the new leader's `persisted` confirmation,
+   or — if it still holds unconfirmed local edits while idle and cannot
+   confirm them — its eviction path tries to take the lease back and flush
+   itself rather than destroying the room and losing the edits.
 
-**Leader election / failover.** A room campaigns for the lease once it has a
-local socket (idle empty rooms do not). The leader renews on every tick well
-inside `BUS_LEASE_MS` (default 10s); a crashed leader stops renewing, the key
-expires, and a follower acquires it. On takeover the new leader enqueues one
-full-state checkpoint (`Y.encodeStateAsUpdate`) for an immediate flush. That
-covers the edge where the dead leader had relayed an update to peers but died
-within its flush window: the converged state already lives in the new leader's
-memory (it received the same bus frames) and is persisted in one row. It then
-serves normal deltas thereafter. Snapshot/evict logic, including
+**Leader election / failover.** A room campaigns for the lease immediately
+when its first client connects (then again on every tick while unowned), so
+the no-leader window is near zero; idle empty rooms do not campaign. The
+leader renews on every tick well inside `BUS_LEASE_MS` (default 10s). A crashed
+leader stops renewing, the key expires, and a follower acquires it. On
+takeover the new leader enqueues one full-state checkpoint
+(`Y.encodeStateAsUpdate`) for an immediate flush. That covers the edge where
+the dead leader had relayed an update to peers but died within its flush
+window: the converged state already lives in the new leader's buffer (local
+edits are retained without a leader, bus edits since it joined are buffered
+once it leads, and the startup sync-step1/2 exchange below fills any earlier
+gap) and is persisted in one row. Snapshot/evict logic, including
 "flush-failure keeps the room in memory and retries", is unchanged.
 
 **Bootstrap join.** A room loads the durable state (S3 snapshot + Postgres
@@ -429,7 +454,7 @@ WS     /collab/:fileId?token=...         owner/editor may write, viewer read-onl
 
 ## 7. Tests
 
-### 7.1 Backend (57 tests)
+### 7.1 Backend (64 tests)
 
 ```bash
 cd backend && npm test
@@ -491,7 +516,8 @@ JWT/sessions are isolated like two real browsers) and asserts:
 - [x] Reconnect with backoff, dead-peer ping/pong, save/connection indicators,
       permission and sync error toasts
 - [x] Backend unit + HTTP integration + real WebSocket integration tests pass
-      (57/57), including a two-instance cross-backend convergence suite
+      (64/64), including a two-instance cross-backend convergence suite
+      and targeted no-leader-window / leader-loss / failed-publish regression tests
 - [x] Playwright two-browser E2E provided and Docker-runnable
 - [x] `docker compose up --build` starts TWO backends, an internal load balancer,
       Postgres/Redis/MinIO and the frontend, with migrations and bucket

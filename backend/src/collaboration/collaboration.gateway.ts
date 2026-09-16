@@ -251,6 +251,9 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
     };
     room.connections.set(ws, conn);
     room.touch();
+    // Minimise the window where a fresh room has no persistence leader: try
+    // to acquire the lease immediately rather than waiting for the tick.
+    void this.rooms.tryBecomeLeader(documentId);
 
     // Push current awareness (cursors/presence) to the newcomer.
     const states = room.awareness.getStates();
@@ -367,7 +370,9 @@ export class CollaborationGateway implements OnModuleInit, OnModuleDestroy {
           );
           return;
         }
-        room.applyClientUpdate(update, ws);
+        // Await so Redis publish failures are queued/retried by the room
+        // rather than silently dropping the update.
+        await room.applyClientUpdate(update, ws);
         return;
       }
       return;
